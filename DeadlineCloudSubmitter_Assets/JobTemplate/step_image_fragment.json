@@ -7,8 +7,7 @@
           {
             "name": "attr.worker.os.family",
             "anyOf": [
-              "windows",
-              "macos"
+              "windows"
             ]
           }
         ]
@@ -20,26 +19,46 @@
             "args": [
               "{{Param.JobScriptDir}}/call_aerender.py",
               "--deadline-cloud",
-              "--project", "{{Param.ProjectFile}}",
-              "--render_queue_index", "{{Param.RenderQueueIndex}}",
-              "--output", "{{Param.OutputDir}}/{{Param.OutputFileName}}",
-              "--frames", "{{Param.Frames}}",
-              "--multi-frame-rendering", "{{Param.MultiFrameRendering}}",
-              "--max-cpu-usage-percentage", "{{Param.MaxCpuUsagePercentage}}",
-              "--ignore-missing-dependencies", "{{Param.IgnoreMissingDependencies}}",
-              "--concurrency", "{{Param.Concurrency}}",
-              "--max_concurrency", "{{Param.MaxConcurrency}}",
-              "--ram_per_process_gb", "{{Param.RamPerProcessGB}}",
-              "--mfr_threads", "{{Param.MfrThreads}}",
-              "--disable_mfr", "{{Param.DisableMfr}}",
-              "--disable_affinity", "{{Param.DisableAffinity}}",
-              "--spawn_delay", "{{Param.SpawnDelay}}",
-              "--child_grace_sec", "{{Param.ChildGraceSec}}",
-              "--no_kill_on_fail", "{{Param.NoKillOnFail}}",
-              "--output_is_pattern", "{{Param.OutputIsPattern}}",
-              "--aerender_path", "{{Param.AerenderPath}}",
-              "--env_file", "{{Param.EnvFile}}",
-              "--log_file", "{{Param.LogFile}}"
+              "--project",
+              "{{Param.ProjectFile}}",
+              "--render_queue_index",
+              "{{Param.RenderQueueIndex}}",
+              "--output",
+              "{{Param.OutputDir}}/{{Param.OutputFileName}}",
+              "--frames",
+              "{{Param.Frames}}",
+              "--multi-frame-rendering",
+              "{{Param.MultiFrameRendering}}",
+              "--max-cpu-usage-percentage",
+              "{{Param.MaxCpuUsagePercentage}}",
+              "--ignore_missing_dependencies",
+              "{{Param.IgnoreMissingDependencies}}",
+              "--concurrency",
+              "{{Param.Concurrency}}",
+              "--max_concurrency",
+              "{{Param.MaxConcurrency}}",
+              "--ram_per_process_gb",
+              "{{Param.RamPerProcessGB}}",
+              "--mfr_threads",
+              "{{Param.MfrThreads}}",
+              "--disable_mfr",
+              "{{Param.DisableMfr}}",
+              "--disable_affinity",
+              "{{Param.DisableAffinity}}",
+              "--spawn_delay",
+              "{{Param.SpawnDelay}}",
+              "--child_grace_sec",
+              "{{Param.ChildGraceSec}}",
+              "--no_kill_on_fail",
+              "{{Param.NoKillOnFail}}",
+              "--output_is_pattern",
+              "{{Param.OutputIsPattern}}",
+              "--aerender_path",
+              "{{Param.AerenderPath}}",
+              "--env_file",
+              "{{Param.EnvFile}}",
+              "--log_file",
+              "{{Param.LogFile}}"
             ]
           }
         }

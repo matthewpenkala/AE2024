@@ -59,7 +59,7 @@
         "label": "Output File Pattern",
         "groupLabel": "Render Parameters"
       },
-      "default": "output_####.png",
+      "default": "output.mp4",
       "description": "The file name used for aerender cmd. Not a changeable parameter."
     },
     {
@@ -69,7 +69,8 @@
         "control": "LINE_EDIT",
         "label": "Start Frame - End Frame",
         "groupLabel": "Frame Range"
-      }
+      },
+      "default": "1-10"
     },
     {
       "name": "MultiFrameRendering",

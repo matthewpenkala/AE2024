@@ -59,7 +59,7 @@
         "label": "Output File Pattern",
         "groupLabel": "Render Parameters"
       },
-      "default": "output.mp4",
+      "default": "output_####.png",
       "description": "The file name used for aerender cmd. Not a changeable parameter."
     },
     {
@@ -69,8 +69,7 @@
         "control": "LINE_EDIT",
         "label": "Start Frame - End Frame",
         "groupLabel": "Frame Range"
-      },
-      "default": "1-10"
+      }
     },
     {
       "name": "MultiFrameRendering",
@@ -164,6 +163,7 @@
         "label": "Disable MFR",
         "groupLabel": "STMPO"
       }
+    },
     {
       "name": "DisableAffinity",
       "type": "STRING",
