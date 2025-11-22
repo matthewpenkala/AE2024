@@ -215,9 +215,9 @@ def main():
 
     if args.env_file and str(args.env_file).upper() not in ("NONE","__NONE__","NULL","FALSE","0"):
         cmd += ["--env_file", args.env_file]
-if args.log_file and str(args.log_file).upper() not in ("NONE","__NONE__","NULL","FALSE","0"):
+    if args.log_file and str(args.log_file).upper() not in ("NONE","__NONE__","NULL","FALSE","0"):
         cmd += ["--log_file", args.log_file]
-_logger.info("[call_aerender] Launching STMPO wrapper:")
+    _logger.info("[call_aerender] Launching STMPO wrapper:")
     _logger.info(" ".join(cmd))
 
     # Run STMPO wrapper. Let it stream logs to stdout, which Deadline captures.
