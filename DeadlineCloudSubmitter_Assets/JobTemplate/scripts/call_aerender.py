@@ -185,6 +185,7 @@ def main():
     cmd = [
         sys.executable, str(stmpo_path),
         "--project", args.project,
+        "--rqindex", str(args.render_queue_index),
         "--output", args.output,
         "--start", str(start_frame),
         "--end", str(end_frame),
