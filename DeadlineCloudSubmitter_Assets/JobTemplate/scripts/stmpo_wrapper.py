@@ -375,6 +375,19 @@ def main():
     args = parse_args()
     logger = setup_logging(args.log_file)
 
+    def log_affinity_diagnostics(ex: Exception):
+        msg = str(ex).lower()
+        if "winerror 87" in msg or "parameter is incorrect" in msg:
+            logger.warning("Affinity diagnostic: Windows rejected the CPU list (WinError 87).")
+            logger.warning("Hint: This typically happens when CPU indices span multiple processor"  \
+                           " groups. Validate numa_map.json against the host and try --disable_affinity if"  \
+                           " the map is outdated.")
+            logger.warning("Hint: psutil on Windows cannot cross processor groups; keep each affinity set"  \
+                           " within a single 64-core group or disable affinity.")
+        else:
+            logger.warning("Affinity diagnostic: failed to set CPU affinity; affinity attempts will be"  \
+                           " skipped for remaining children.")
+
     if args.start > args.end:
         logger.error(f"Invalid frame range: start={args.start} > end={args.end}")
         sys.exit(2)
@@ -445,6 +458,8 @@ def main():
 
     logger.info(f"Starting spawn sequence with {args.spawn_delay}s stagger delay...")
 
+    affinity_applicable = bool(affinities) and not args.disable_affinity
+
     for i, (s, e) in enumerate(ranges):
         if stop_event.is_set(): break
         if i > 0 and args.spawn_delay > 0: time.sleep(args.spawn_delay)
@@ -463,15 +478,16 @@ def main():
                 errors="replace",
                 bufsize=1
             )
-            
+
             aff = None
-            if affinities and i < len(affinities):
+            if affinity_applicable and affinities and i < len(affinities):
                 aff = affinities[i]
-                if not args.disable_affinity:
-                    try:
-                        psutil.Process(p.pid).cpu_affinity(aff)
-                    except Exception as ex:
-                        logger.warning(f"Affinity warning PID {p.pid}: {ex}")
+                try:
+                    psutil.Process(p.pid).cpu_affinity(aff)
+                except Exception as ex:
+                    logger.warning(f"Affinity warning PID {p.pid}: {ex}")
+                    log_affinity_diagnostics(ex)
+                    affinity_applicable = False
 
             threading.Thread(target=stream_reader, args=(p.pid, p.stdout, out_q, "LOG"), daemon=True).start()
             children.append(ChildProc(popen=p, frame_range=(s, e), affinity=aff))
