@@ -167,8 +167,8 @@
     },
     {
       "name": "DisableMfr",
-      "type": "BOOL",
-      "default": false,
+      "type": "STRING",
+      "default": "false",
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Disable MFR",
@@ -188,8 +188,8 @@
     },
     {
       "name": "DisableAffinity",
-      "type": "BOOL",
-      "default": false,
+      "type": "STRING",
+      "default": "false",
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Disable CPU affinity",
@@ -218,8 +218,8 @@
     },
     {
       "name": "NoKillOnFail",
-      "type": "BOOL",
-      "default": false,
+      "type": "STRING",
+      "default": "false",
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Don't kill siblings on fail",
@@ -228,8 +228,8 @@
     },
     {
       "name": "OutputIsPattern",
-      "type": "BOOL",
-      "default": false,
+      "type": "STRING",
+      "default": "false",
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Output is full pattern",
