@@ -1475,6 +1475,15 @@ function generateParameterValues(
             value: ignoreMissingDependencies === true ? "ON" : "OFF",
         })
     }
+    // Hidden parameters must always have a value, even if unused.
+    parameterValuesList.push({
+        name: prefix + "_EnvFile",
+        value: "",
+    });
+    parameterValuesList.push({
+        name: prefix + "_LogFile",
+        value: "",
+    });
     return {
         parameterValues: parameterValuesList
     };
