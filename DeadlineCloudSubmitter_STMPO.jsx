@@ -2108,14 +2108,6 @@ function generateStepTemplateFragment(bundlePath, isImageSeq, renderQueueItemInd
     // Parse the template string to a JSON object
     const stepTemplateObject = JSON.parse(stepTemplateContents);
 
-    if (isImageSeq) {
-        // Replace parameter names in the creation of `Index`
-        const taskParameters = stepTemplateObject.steps[0].parameterSpace.taskParameterDefinitions[0]
-        taskParameters.range = taskParameters.range.replace(paramPatternRegex, "Param." + generateParameterName(renderQueueItemIndex, compName, "") + "_");
-        taskParameters.name = generateParameterName(renderQueueItemIndex, compName, taskParameters.name);
-        stepTemplateObject.steps[0].parameterSpace.taskParameterDefinitions[0] = taskParameters;
-    }
-
     stepTemplateObject.steps[0].name = generateParameterName(renderQueueItemIndex, compName, "");
     // Replace any parameter names in onRun script
     const scriptArgs = stepTemplateObject.steps[0].script.actions.onRun.args;
@@ -2172,6 +2164,7 @@ function SubmitSelection(selection, selectionSettings) {
         "scripts/get_user_fonts.py",
         "scripts/font_manager.py",
         "scripts/call_aerender.py",
+        "scripts/stmpo_wrapper.py",
         "scripts/create_output_directory.py",
         "template.json",
         "image_template.json",

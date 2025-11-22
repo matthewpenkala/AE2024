@@ -160,8 +160,8 @@
     },
     {
       "name": "DisableMfr",
-      "type": "BOOL",
-      "default": false,
+      "type": "STRING",
+      "default": "false",
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Disable MFR",
@@ -169,20 +169,9 @@
       }
     },
     {
-      "name": "NumaMap",
-      "type": "STRING",
-      "default": "C:\\Deadline\\Scripts\\numa_map.json",
-      "userInterface": {
-        "control": "TEXT_BOX",
-        "label": "NUMA map JSON",
-        "groupLabel": "STMPO Advanced"
-      },
-      "description": "Absolute path on the worker to numa_map.json."
-    },
-    {
       "name": "DisableAffinity",
-      "type": "BOOL",
-      "default": false,
+      "type": "STRING",
+      "default": "false",
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Disable CPU affinity",
@@ -211,8 +200,8 @@
     },
     {
       "name": "NoKillOnFail",
-      "type": "BOOL",
-      "default": false,
+      "type": "STRING",
+      "default": "false",
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Don't kill siblings on fail",
@@ -221,8 +210,8 @@
     },
     {
       "name": "OutputIsPattern",
-      "type": "BOOL",
-      "default": false,
+      "type": "STRING",
+      "default": "false",
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Output is full pattern",
@@ -234,7 +223,7 @@
       "type": "STRING",
       "default": "E:\\DCC\\Adobe\\Adobe After Effects 2024\\Support Files\\aerender.exe",
       "userInterface": {
-        "control": "TEXT_BOX"
+        "control": "HIDDEN"
       },
       "description": "Absolute path on the worker to aerender.exe."
     },
@@ -356,8 +345,6 @@
               "{{Param.MfrThreads}}",
               "--disable_mfr",
               "{{Param.DisableMfr}}",
-              "--numa_map",
-              "{{Param.NumaMap}}",
               "--disable_affinity",
               "{{Param.DisableAffinity}}",
               "--spawn_delay",
