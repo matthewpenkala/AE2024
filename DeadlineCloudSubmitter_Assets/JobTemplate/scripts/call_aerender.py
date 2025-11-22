@@ -30,22 +30,8 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from openjd.sessions._runner_step_script import (
-    ActionModel,
-    EmbeddedFiles,
-    EmbeddedFileText,
-    StepActionsModel,
-    StepScriptModel,
-)
-from openjd.sessions._runner_step_script_actions import StepScriptActions as Actions
-from openjd.adaptor_runtime_client import Action as ClientAction
-from openjd.adaptor_runtime_client import AdaptorRuntimeClient, AdaptorState
-from openjd.adaptor_runtime_client import CancelationState
-from openjd.adaptor_runtime_client import ClientInterface
-from openjd.adaptor_runtime_client import create_adaptor_environment
-from openjd.adaptor_runtime_client import create_logger
-
-_logger = create_logger(__name__)
+_logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # -----------------------------
 # Helpers for frame parsing
