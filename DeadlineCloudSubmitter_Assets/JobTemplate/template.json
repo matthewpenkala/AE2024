@@ -142,7 +142,7 @@
     {
       "name": "EnvFile",
       "type": "PATH",
-      "default": "",
+      "default": "__NONE__",
       "userInterface": {
         "control": "HIDDEN"
       }
@@ -150,7 +150,7 @@
     {
       "name": "LogFile",
       "type": "PATH",
-      "default": "",
+      "default": "__NONE__",
       "userInterface": {
         "control": "HIDDEN"
       }

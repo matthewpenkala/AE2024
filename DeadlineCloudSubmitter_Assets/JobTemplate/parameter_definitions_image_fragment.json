@@ -59,7 +59,7 @@
         "label": "Output File Pattern",
         "groupLabel": "Render Parameters"
       },
-      "default": "output.mp4",
+      "default": "output_####.png",
       "description": "The file name used for aerender cmd. Not a changeable parameter."
     },
     {
@@ -227,7 +227,7 @@
     {
       "name": "EnvFile",
       "type": "PATH",
-      "default": "",
+      "default": "__NONE__",
       "userInterface": {
         "control": "HIDDEN"
       }
@@ -235,7 +235,7 @@
     {
       "name": "LogFile",
       "type": "PATH",
-      "default": "",
+      "default": "__NONE__",
       "userInterface": {
         "control": "HIDDEN"
       }
