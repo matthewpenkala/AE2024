@@ -159,6 +159,10 @@
       "name": "DisableMfr",
       "type": "STRING",
       "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Disable MFR",
@@ -169,6 +173,10 @@
       "name": "DisableAffinity",
       "type": "STRING",
       "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Disable CPU affinity",
@@ -199,6 +207,10 @@
       "name": "NoKillOnFail",
       "type": "STRING",
       "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Don't kill siblings on fail",
@@ -209,6 +221,10 @@
       "name": "OutputIsPattern",
       "type": "STRING",
       "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Output is full pattern",
