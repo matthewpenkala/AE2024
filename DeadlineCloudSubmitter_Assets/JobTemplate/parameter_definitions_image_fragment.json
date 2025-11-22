@@ -1,0 +1,285 @@
+{
+  "parameterDefinitions": [
+    {
+      "name": "ProjectFile",
+      "type": "PATH",
+      "objectType": "FILE",
+      "dataFlow": "IN",
+      "userInterface": {
+        "control": "CHOOSE_INPUT_FILE",
+        "label": "Project file",
+        "groupLabel": "Source",
+        "fileFilters": [
+          {
+            "label": "After Effects project files",
+            "patterns": [
+              "*.aep",
+              "*.aepx"
+            ]
+          },
+          {
+            "label": "All Files",
+            "patterns": [
+              "*"
+            ]
+          }
+        ]
+      },
+      "description": "The After Effects project file to render."
+    },
+    {
+      "name": "RenderQueueIndex",
+      "type": "INT",
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "Render Queue Index",
+        "groupLabel": "Source"
+      },
+      "description": "The index of the item in the render queue to render.",
+      "default": 1
+    },
+    {
+      "name": "OutputDir",
+      "type": "PATH",
+      "objectType": "DIRECTORY",
+      "dataFlow": "OUT",
+      "userInterface": {
+        "control": "CHOOSE_DIRECTORY",
+        "label": "Output Directory",
+        "groupLabel": "Render Parameters"
+      },
+      "default": "./output",
+      "description": "Choose the render output directory."
+    },
+    {
+      "name": "OutputFileName",
+      "type": "STRING",
+      "userInterface": {
+        "control": "HIDDEN",
+        "label": "Output File Pattern",
+        "groupLabel": "Render Parameters"
+      },
+      "default": "output_####.png",
+      "description": "The file name used for aerender cmd. Not a changeable parameter."
+    },
+    {
+      "name": "Frames",
+      "type": "STRING",
+      "userInterface": {
+        "control": "LINE_EDIT",
+        "label": "Start Frame - End Frame",
+        "groupLabel": "Frame Range"
+      }
+    },
+    {
+      "name": "ChunkSize",
+      "type": "INT",
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "Frames Per Task",
+        "groupLabel": "Frame Range"
+      },
+      "description": "The chunk size of frames per task to render",
+      "minValue": 1
+    },
+    {
+      "name": "MultiFrameRendering",
+      "type": "STRING",
+      "default": "OFF",
+      "allowedValues": [
+        "ON",
+        "OFF"
+      ],
+      "userInterface": {
+        "control": "DROPDOWN_LIST",
+        "label": "Enable or disable multi-frame rendering",
+        "groupLabel": "Multi-Frame Rendering"
+      },
+      "description": "Multi frame rendering settings"
+    },
+    {
+      "name": "MaxCpuUsagePercentage",
+      "type": "INT",
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "Max CPU Usage Percentage",
+        "groupLabel": "Multi-Frame Rendering"
+      },
+      "description": "Max Cpu Percentage to use with Multi-Frame Rendering, ignored if MFR is OFF",
+      "minValue": 1,
+      "maxValue": 100,
+      "default": 90
+    },
+    {
+      "name": "IgnoreMissingDependencies",
+      "type": "STRING",
+      "default": "OFF",
+      "allowedValues": [
+        "ON",
+        "OFF"
+      ],
+      "userInterface": {
+        "control": "DROPDOWN_LIST",
+        "label": "Ignore Missing Dependencies",
+        "groupLabel": "Ignore Missing Dependencies"
+      },
+      "description": "Allows render to continue without failing if referenced files are missing."
+    },
+    {
+      "name": "Concurrency",
+      "type": "INT",
+      "default": 32,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "STMPO Concurrency (-1=auto)",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "MaxConcurrency",
+      "type": "INT",
+      "default": 48,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "STMPO Max Concurrency",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "RamPerProcessGB",
+      "type": "FLOAT",
+      "default": 10.0,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "RAM per aerender (GB)",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "MfrThreads",
+      "type": "INT",
+      "default": 4,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "MFR Threads per aerender",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "DisableMfr",
+      "type": "BOOL",
+      "default": false,
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Disable MFR",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "NumaMap",
+      "type": "STRING",
+      "default": "C:\\Deadline\\Scripts\\numa_map.json",
+      "userInterface": {
+        "control": "TEXT_BOX",
+        "label": "NUMA map JSON",
+        "groupLabel": "STMPO Advanced"
+      },
+      "description": "Absolute path on the worker to numa_map.json."
+    },
+    {
+      "name": "DisableAffinity",
+      "type": "BOOL",
+      "default": false,
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Disable CPU affinity",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "SpawnDelay",
+      "type": "FLOAT",
+      "default": 2.0,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "Spawn delay (sec)",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "ChildGraceSec",
+      "type": "INT",
+      "default": 10,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "Child grace before kill (sec)",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "NoKillOnFail",
+      "type": "BOOL",
+      "default": false,
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Don't kill siblings on fail",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "OutputIsPattern",
+      "type": "BOOL",
+      "default": false,
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Output is full pattern",
+        "groupLabel": "Output"
+      }
+    },
+    {
+      "name": "AerenderPath",
+      "type": "STRING",
+      "default": "E:\\DCC\\Adobe\\Adobe After Effects 2024\\Support Files\\aerender.exe",
+      "userInterface": {
+        "control": "TEXT_BOX"
+      },
+      "description": "Absolute path on the worker to aerender.exe."
+    },
+    {
+      "name": "EnvFile",
+      "type": "PATH",
+      "default": "",
+      "userInterface": {
+        "control": "HIDDEN"
+      }
+    },
+    {
+      "name": "LogFile",
+      "type": "PATH",
+      "default": "",
+      "userInterface": {
+        "control": "HIDDEN"
+      }
+    },
+    {
+      "name": "JobScriptDir",
+      "description": "Directory containing embedded scripts.",
+      "userInterface": {
+        "control": "HIDDEN"
+      },
+      "type": "PATH",
+      "objectType": "DIRECTORY",
+      "dataFlow": "IN",
+      "default": "scripts"
+    },
+    {
+      "name": "CondaPackages",
+      "type": "STRING",
+      "userInterface": {
+        "control": "HIDDEN"
+      },
+      "default": "aftereffects={{AE_VERSION}}",
+      "description": "If a queue accepts this parameter, it will create a conda virtual environment from it."
+    }
+  ]
+}

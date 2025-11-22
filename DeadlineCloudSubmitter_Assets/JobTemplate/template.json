@@ -1,0 +1,232 @@
+{
+  "specificationVersion": "jobtemplate-2023-09",
+  "name": "{{JOB_NAME}}",
+  "description": "A simple job bundle that allows a user to select a project and comp to render with aerender.",
+  "parameterDefinitions": [
+    {
+      "name": "ProjectFile",
+      "type": "PATH",
+      "objectType": "FILE",
+      "dataFlow": "IN",
+      "userInterface": {
+        "control": "CHOOSE_INPUT_FILE",
+        "label": "Project file",
+        "groupLabel": "Source",
+        "fileFilters": [
+          {
+            "label": "After Effects project files",
+            "patterns": [
+              "*.aep",
+              "*.aepx"
+            ]
+          },
+          {
+            "label": "All Files",
+            "patterns": [
+              "*"
+            ]
+          }
+        ]
+      },
+      "description": "The After Effects project file to render."
+    },
+    {
+      "name": "Concurrency",
+      "type": "INT",
+      "default": 32,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "STMPO Concurrency (-1=auto)",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "MaxConcurrency",
+      "type": "INT",
+      "default": 48,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "STMPO Max Concurrency",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "RamPerProcessGB",
+      "type": "FLOAT",
+      "default": 10.0,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "RAM per aerender (GB)",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "MfrThreads",
+      "type": "INT",
+      "default": 4,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "MFR Threads per aerender",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "DisableMfr",
+      "type": "BOOL",
+      "default": false,
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Disable MFR",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "NumaMap",
+      "type": "STRING",
+      "default": "C:\\Deadline\\Scripts\\numa_map.json",
+      "userInterface": {
+        "control": "TEXT_BOX",
+        "label": "NUMA map JSON",
+        "groupLabel": "STMPO Advanced"
+      },
+      "description": "Absolute path on the worker to numa_map.json."
+    },
+    {
+      "name": "DisableAffinity",
+      "type": "BOOL",
+      "default": false,
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Disable CPU affinity",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "SpawnDelay",
+      "type": "FLOAT",
+      "default": 2.0,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "Spawn delay (sec)",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "ChildGraceSec",
+      "type": "INT",
+      "default": 10,
+      "userInterface": {
+        "control": "SPIN_BOX",
+        "label": "Child grace before kill (sec)",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "NoKillOnFail",
+      "type": "BOOL",
+      "default": false,
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Don't kill siblings on fail",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "OutputIsPattern",
+      "type": "BOOL",
+      "default": false,
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Output is full pattern",
+        "groupLabel": "Output"
+      }
+    },
+    {
+      "name": "AerenderPath",
+      "type": "STRING",
+      "default": "E:\\DCC\\Adobe\\Adobe After Effects 2024\\Support Files\\aerender.exe",
+      "userInterface": {
+        "control": "TEXT_BOX"
+      },
+      "description": "Absolute path on the worker to aerender.exe."
+    },
+    {
+      "name": "EnvFile",
+      "type": "PATH",
+      "default": "",
+      "userInterface": {
+        "control": "HIDDEN"
+      }
+    },
+    {
+      "name": "LogFile",
+      "type": "PATH",
+      "default": "",
+      "userInterface": {
+        "control": "HIDDEN"
+      }
+    },
+    {
+      "name": "JobScriptDir",
+      "description": "Directory containing embedded scripts.",
+      "userInterface": {
+        "control": "HIDDEN"
+      },
+      "type": "PATH",
+      "objectType": "DIRECTORY",
+      "dataFlow": "IN",
+      "default": "scripts"
+    },
+    {
+      "name": "CondaPackages",
+      "type": "STRING",
+      "userInterface": {
+        "control": "HIDDEN"
+      },
+      "default": "aftereffects={{AE_VERSION}}",
+      "description": "If a queue accepts this parameter, it will create a conda virtual environment from it."
+    }
+  ],
+  "jobEnvironments": [
+    {
+      "name": "Create Output Directories",
+      "description": "Create Output Directories",
+      "script": {
+        "actions": {
+          "onEnter": {
+            "command": "python",
+            "args": [
+              "{{Param.JobScriptDir}}/create_output_directory.py",
+              "{{Param.OutputDir}}"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "Install Fonts to Worker",
+      "description": "Install Fonts to Worker",
+      "script": {
+        "actions": {
+          "onEnter": {
+            "command": "python",
+            "args": [
+              "{{Param.JobScriptDir}}/font_manager.py",
+              "install",
+              "{{Session.WorkingDirectory}}"
+            ]
+          },
+          "onExit": {
+            "command": "python",
+            "args": [
+              "{{Param.JobScriptDir}}/font_manager.py",
+              "remove",
+              "{{Session.WorkingDirectory}}"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "steps": []
+}
