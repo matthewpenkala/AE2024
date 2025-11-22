@@ -30,7 +30,6 @@ import sys
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from openjd.sessions import PathMappingRule, PathMappingRuleType
 from openjd.sessions._runner_step_script import (
     ActionModel,
     EmbeddedFiles,
