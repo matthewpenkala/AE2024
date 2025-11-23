@@ -31,6 +31,9 @@ import subprocess
 import sys
 import threading
 import time
+import platform
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -46,6 +49,175 @@ DEFAULT_AERENDER = r"E:\DCC\Adobe\Adobe After Effects 2024\Support Files\aerende
 DEFAULT_NUMA_MAP = r"C:\Deadline\Scripts\numa_map.json"
 PROC_GROUP_SIZE = 64
 
+
+
+# -----------------------------
+# Windows processor-group affinity helpers
+# -----------------------------
+# On systems with >64 logical CPUs, Windows uses processor groups (max 64 logical CPUs per group).
+# psutil / SetProcessAffinityMask cannot set affinity across groups directly.
+# We therefore:
+#   1) Compute a group-local 64-bit mask for each affinity block.
+#   2) Move the child process' main thread into that group via SetThreadGroupAffinity.
+#   3) Apply the group-local mask to the process via SetProcessAffinityMask.
+#
+# On Windows 11 / Server 2022, processes span all groups by default; calling
+# SetThreadGroupAffinity intentionally restricts to a single group and sets that as primary.
+# See Microsoft Processor Groups documentation.
+_IS_WINDOWS = (os.name == "nt")
+
+if _IS_WINDOWS:
+    TH32CS_SNAPTHREAD = 0x00000004
+    THREAD_QUERY_INFORMATION = 0x0040
+    THREAD_SET_INFORMATION = 0x0020
+    PROCESS_QUERY_INFORMATION = 0x0400
+    PROCESS_SET_INFORMATION = 0x0200
+
+    class THREADENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    class GROUP_AFFINITY(ctypes.Structure):
+        _fields_ = [
+            ("Mask", ctypes.c_ulonglong),
+            ("Group", wintypes.WORD),
+            ("Reserved", wintypes.WORD * 3),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
+    CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+
+    Thread32First = kernel32.Thread32First
+    Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
+    Thread32First.restype = wintypes.BOOL
+
+    Thread32Next = kernel32.Thread32Next
+    Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
+    Thread32Next.restype = wintypes.BOOL
+
+    OpenThread = kernel32.OpenThread
+    OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    OpenThread.restype = wintypes.HANDLE
+
+    OpenProcess = kernel32.OpenProcess
+    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    OpenProcess.restype = wintypes.HANDLE
+
+    CloseHandle = kernel32.CloseHandle
+    CloseHandle.argtypes = [wintypes.HANDLE]
+    CloseHandle.restype = wintypes.BOOL
+
+    SetThreadGroupAffinity = getattr(kernel32, "SetThreadGroupAffinity", None)
+    if SetThreadGroupAffinity:
+        SetThreadGroupAffinity.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(GROUP_AFFINITY),
+            ctypes.POINTER(GROUP_AFFINITY),
+        ]
+        SetThreadGroupAffinity.restype = wintypes.BOOL
+
+    SetProcessAffinityMask = kernel32.SetProcessAffinityMask
+    SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_ulonglong]
+    SetProcessAffinityMask.restype = wintypes.BOOL
+
+
+    def _get_main_thread_id(pid):
+        """Best-effort: return the smallest thread id owned by pid."""
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+        if snap == wintypes.HANDLE(-1).value:
+            return None
+        try:
+            te = THREADENTRY32()
+            te.dwSize = ctypes.sizeof(THREADENTRY32)
+            ok = Thread32First(snap, ctypes.byref(te))
+            tids = []
+            while ok:
+                if te.th32OwnerProcessID == pid:
+                    tids.append(int(te.th32ThreadID))
+                ok = Thread32Next(snap, ctypes.byref(te))
+            return min(tids) if tids else None
+        finally:
+            CloseHandle(snap)
+
+
+    def _compute_group_and_mask(cpus):
+        g = int(cpus[0] // PROC_GROUP_SIZE)
+        mask = 0
+        for c in cpus:
+            cg = int(c // PROC_GROUP_SIZE)
+            if cg != g:
+                raise ValueError("Affinity block spans multiple processor groups.")
+            mask |= (1 << int(c % PROC_GROUP_SIZE))
+        return g, mask
+
+
+    def apply_group_affinity(pid, cpus, logger):
+        """Apply processor-group local affinity to pid."""
+        try:
+            group, mask = _compute_group_and_mask(cpus)
+        except Exception as ex:
+            logger.warning("Affinity plan invalid for PID %s: %s" % (pid, ex))
+            return False
+
+        tid = None
+        # Retry because very new processes may not show threads immediately.
+        for _ in range(10):
+            tid = _get_main_thread_id(pid)
+            if tid is not None:
+                break
+            time.sleep(0.05)
+
+        if tid is None:
+            logger.warning("Could not locate main thread for PID %s; skipping group affinity." % pid)
+            return False
+
+        hThread = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, False, tid)
+        if not hThread:
+            logger.warning("OpenThread failed for TID %s (PID %s); skipping group affinity." % (tid, pid))
+            return False
+        try:
+            if SetThreadGroupAffinity:
+                ga = GROUP_AFFINITY(ctypes.c_ulonglong(mask), wintypes.WORD(group), (wintypes.WORD * 3)(0, 0, 0))
+                prev = GROUP_AFFINITY()
+                ok = SetThreadGroupAffinity(hThread, ctypes.byref(ga), ctypes.byref(prev))
+                if not ok:
+                    err = ctypes.get_last_error()
+                    logger.warning("SetThreadGroupAffinity failed for PID %s group %s err=%s." % (pid, group, err))
+                    return False
+            else:
+                logger.warning("SetThreadGroupAffinity not available on this host; skipping group affinity.")
+                return False
+        finally:
+            CloseHandle(hThread)
+
+        hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, False, pid)
+        if not hProc:
+            logger.warning("OpenProcess failed for PID %s; skipping process mask." % pid)
+            return False
+        try:
+            ok = SetProcessAffinityMask(hProc, ctypes.c_ulonglong(mask))
+            if not ok:
+                err = ctypes.get_last_error()
+                logger.warning("SetProcessAffinityMask failed for PID %s mask=%s err=%s." % (pid, hex(mask), err))
+                return False
+        finally:
+            CloseHandle(hProc)
+
+        logger.info("Applied group affinity to PID %s: group=%s, mask=%s" % (pid, group, hex(mask)))
+        return True
+else:
+    def apply_group_affinity(pid, cpus, logger):
+        return False
 
 # -----------------------------
 # Data structures
@@ -382,7 +554,7 @@ def main():
             logger.warning("Hint: This typically happens when CPU indices span multiple processor"  \
                            " groups. Validate numa_map.json against the host and try --disable_affinity if"  \
                            " the map is outdated.")
-            logger.warning("Hint: psutil on Windows cannot cross processor groups; keep each affinity set"  \
+            logger.warning("Hint: psutil on Windows cannot cross processor groups. STMPO attempts group-aware pinning first; if you still see WinError 87, keep each affinity set"  \
                            " within a single 64-core group or disable affinity.")
         else:
             logger.warning("Affinity diagnostic: failed to set CPU affinity; affinity attempts will be"  \
@@ -483,7 +655,15 @@ def main():
             if affinity_applicable and affinities and i < len(affinities):
                 aff = affinities[i]
                 try:
-                    psutil.Process(p.pid).cpu_affinity(aff)
+                    applied = False
+                    if _IS_WINDOWS and (psutil.cpu_count(logical=True) or 0) > PROC_GROUP_SIZE:
+                        applied = apply_group_affinity(p.pid, aff, logger)
+                    if not applied:
+                        # Fallback to psutil affinity within primary group
+                        psutil.Process(p.pid).cpu_affinity(aff)
+                        applied = True
+                    if not applied:
+                        raise RuntimeError("Affinity not applied")
                 except Exception as ex:
                     logger.warning(f"Affinity warning PID {p.pid}: {ex}")
                     log_affinity_diagnostics(ex)
