@@ -235,6 +235,8 @@ class ChildProc:
     popen: subprocess.Popen
     frame_range: Tuple[int, int]
     affinity: Optional[List[int]]
+    psutil_proc: Optional[psutil.Process]
+    start_time: float
 
 
 # -----------------------------
@@ -547,6 +549,8 @@ def main():
     args = parse_args()
     logger = setup_logging(args.log_file)
 
+    HEARTBEAT_SECONDS = 30
+
     def log_affinity_diagnostics(ex: Exception):
         msg = str(ex).lower()
         if "winerror 87" in msg or "parameter is incorrect" in msg:
@@ -610,6 +614,11 @@ def main():
     child_env = os.environ.copy()
     child_env.update(env_overrides)
 
+    if args.env_file:
+        logger.info(f"Environment overrides loaded from {args.env_file}: {len(env_overrides)} entries")
+    else:
+        logger.info("No env_file provided; using process environment only.")
+
     if args.dry_run:
         logger.info("DRY RUN: Commands/affinities only.")
         for i, (s, e) in enumerate(ranges):
@@ -632,6 +641,11 @@ def main():
 
     affinity_applicable = bool(affinities) and not args.disable_affinity
 
+    logger.info(f"Spawn plan: {len(ranges)} children across frames {args.start}-{args.end} (per-child ~{math.ceil((args.end - args.start + 1)/len(ranges))} frames)")
+
+    last_heartbeat = time.time()
+    completion_logged = set()
+
     for i, (s, e) in enumerate(ranges):
         if stop_event.is_set(): break
         if i > 0 and args.spawn_delay > 0: time.sleep(args.spawn_delay)
@@ -652,6 +666,7 @@ def main():
             )
 
             aff = None
+            proc_handle = None
             if affinity_applicable and affinities and i < len(affinities):
                 aff = affinities[i]
                 try:
@@ -669,8 +684,17 @@ def main():
                     log_affinity_diagnostics(ex)
                     affinity_applicable = False
 
+            try:
+                proc_handle = psutil.Process(p.pid)
+                # Prime cpu_percent so later heartbeats have deltas
+                proc_handle.cpu_percent(None)
+            except Exception as ph_ex:
+                logger.debug(f"Could not attach psutil handle to PID {p.pid}: {ph_ex}")
+                proc_handle = None
+
             threading.Thread(target=stream_reader, args=(p.pid, p.stdout, out_q, "LOG"), daemon=True).start()
-            children.append(ChildProc(popen=p, frame_range=(s, e), affinity=aff))
+            logger.info(f"Spawned PID {p.pid} frames {s}-{e} affinity={aff}")
+            children.append(ChildProc(popen=p, frame_range=(s, e), affinity=aff, psutil_proc=proc_handle, start_time=time.time()))
         except Exception as spawn_ex:
             logger.error(f"Failed to spawn child #{i}: {spawn_ex}")
             stop_event.set()
@@ -688,6 +712,29 @@ def main():
             print(msg, flush=True)
         except queue.Empty: pass
 
+        now = time.time()
+        if now - last_heartbeat >= HEARTBEAT_SECONDS:
+            summaries = []
+            for ch in children:
+                pid = ch.popen.pid
+                state = "exited" if ch.popen.poll() is not None else "running"
+                runtime = now - ch.start_time
+                cpu = mem = status = None
+                if ch.psutil_proc:
+                    try:
+                        status = ch.psutil_proc.status()
+                        cpu = ch.psutil_proc.cpu_percent(None)
+                        mem_info = ch.psutil_proc.memory_info()
+                        mem = mem_info.rss / (1024 ** 2)
+                    except Exception as hb_ex:
+                        logger.debug(f"Heartbeat psutil read failed for PID {pid}: {hb_ex}")
+                summaries.append(
+                    f"PID {pid} {state} frames {ch.frame_range[0]}-{ch.frame_range[1]} "
+                    f"elapsed={runtime:.1f}s status={status} cpu%={cpu} rss_mb={mem}"
+                )
+            logger.info("Heartbeat: " + "; ".join(summaries))
+            last_heartbeat = now
+
         if stop_event.is_set():
             terminate_children(children, logger, args.child_grace_sec)
             sys.exit(3)
@@ -698,6 +745,10 @@ def main():
             if code is None:
                 alive = True
                 continue
+            if ch.popen.pid not in completion_logged:
+                duration = time.time() - ch.start_time
+                logger.info(f"Child PID {ch.popen.pid} completed frames {ch.frame_range[0]}-{ch.frame_range[1]} with code {code} after {duration:.1f}s")
+                completion_logged.add(ch.popen.pid)
             if code != 0 and failed is None:
                 failed = (ch.popen.pid, code)
 
