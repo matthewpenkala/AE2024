@@ -93,7 +93,21 @@
       "default": 32,
       "userInterface": {
         "control": "SPIN_BOX",
-        "label": "STMPO Concurrency (-1=auto)",
+      "label": "STMPO Concurrency (-1=auto)",
+      "groupLabel": "STMPO"
+      }
+    },
+    {
+      "name": "DisableMFR",
+      "type": "STRING",
+      "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Disable Multi-Frame Rendering (MFR)",
         "groupLabel": "STMPO"
       }
     },
