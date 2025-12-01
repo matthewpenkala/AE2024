@@ -2364,8 +2364,9 @@ function SubmitSelection(selection, selectionSettings) {
             return;
         }
 
-        var stepMaxCpuUsagePercentage = selectionSettings.get(dcUtil.getRenderQueueItemID(renderQueueIndex)).maxCpuUsagePercentage();
-        var stepMultiFrameRendering = selectionSettings.get(dcUtil.getRenderQueueItemID(renderQueueIndex)).multiFrameRendering();
+        /// Farm safety: override any stored UI/XMP values
+        var stepMaxCpuUsagePercentage = DEFAULT_MAX_CPU_USAGE_PERCENTAGE; // ignored when MFR off
+        var stepMultiFrameRendering = false; // FORCED OFF
         var stepIgnoreMissingDependencies = selectionSettings.get(dcUtil.getRenderQueueItemID(renderQueueIndex)).ignoreMissingDependencies();
 
         var outputModule = renderQueueItem.outputModule(1).file;
@@ -3136,66 +3137,9 @@ function buildUI(thisObj) {
     perCompSettingsGroup.alignment = ['fill', 'top'];
     perCompSettingsGroup.alignChildren = ['left', 'top'];
 
-    // Multi-frame rendering (MFR) GUI
-    const mfrGroup = perCompSettingsGroup.add("group", undefined, "");
-    mfrGroup.orientation = "column";
-    mfrGroup.alignment = ['fill', 'top'];
-    mfrGroup.alignChildren = ['left', 'center'];
-    mfrGroup.margins = 5;
+        // Multi-frame rendering (MFR) GUI removed for farm safety; MFR is forced OFF.
 
-    const mfrCheckBox = mfrGroup.add("checkbox", undefined, "Enable Multi-Frame Rendering");
-    mfrCheckBox.value = DEFAULT_MULTI_FRAME_RENDERING;
-
-    const maxCpuUsagePercentageGroup = mfrGroup.add("group", undefined, "");
-    maxCpuUsagePercentageGroup.orientation = "row";
-    maxCpuUsagePercentageGroup.alignment = ['fill', 'top'];
-    mfrGroup.orientation = "column";
-
-    const maxCpuUsagePercentageLabel = maxCpuUsagePercentageGroup.add("statictext", undefined, "Max Allowed CPU Usage Percentage");
-    maxCpuUsagePercentageLabel.alignment = ['left', 'center'];
-    maxCpuUsagePercentageLabel.helpTip = "If multi-frame rendering is enabled, set the maximum CPU percentage power to use during multi-frame rendering";
-
-    const maxCpuUsagePercentageTextBox = maxCpuUsagePercentageGroup.add("edittext", undefined, "N/A");
-    maxCpuUsagePercentageTextBox.alignment = ['fill', 'top'];
-    maxCpuUsagePercentageTextBox.helpTip = maxCpuUsagePercentageLabel.helpTip;
-    maxCpuUsagePercentageTextBox.enabled = mfrCheckBox.value;
-    maxCpuUsagePercentageTextBox.text = maxCpuUsagePercentageTextBox.enabled ? DEFAULT_MAX_CPU_USAGE_PERCENTAGE : "N/A";
-
-    function onMaxCpuUsagePercentageChanged() {
-        const maxCpuUsagePercentageValue = Math.abs(parseInt(maxCpuUsagePercentageTextBox.text));
-        if (isNaN(maxCpuUsagePercentageValue) || maxCpuUsagePercentageValue > 100) {
-            maxCpuUsagePercentageTextBox.text = DEFAULT_MAX_CPU_USAGE_PERCENTAGE;
-        } else {
-            // Need to reassign in case input string is a number followed my random characters
-            // since parseInt parses the first number it finds in a provided string.
-            maxCpuUsagePercentageTextBox.text = maxCpuUsagePercentageValue;
-        }
-        const selectionItem = dcUtil.getSelection(list);
-        if (selectionItem) {
-            uiSettingsState.get(dcUtil.getRenderQueueItemID(selectionItem.renderQueueIndex)).setMaxCpuUsagePercentage(parseInt(maxCpuUsagePercentageTextBox.text));
-        }
-    }
-    maxCpuUsagePercentageTextBox.onChange = onMaxCpuUsagePercentageChanged;
-
-    // Disable max CPU percentage textbox when multi frame rendering is disabled
-    function onMfrCheckBoxClicked() {
-        const isMfrChecked = mfrCheckBox.value;
-        const selectionItem = dcUtil.getSelection(list);
-        if (selectionItem) {
-            var RQIID = dcUtil.getRenderQueueItemID(selectionItem.renderQueueIndex);
-            if (!isMfrChecked) {
-                maxCpuUsagePercentageTextBox.text = "N/A";
-                uiSettingsState.get(RQIID).setMultiFrameRendering(false);
-            } else {
-                maxCpuUsagePercentageTextBox.text = uiSettingsState.get(RQIID).maxCpuUsagePercentage();
-                uiSettingsState.get(RQIID).setMultiFrameRendering(true);
-            }
-        }
-        maxCpuUsagePercentageTextBox.enabled = isMfrChecked;
-    }
-    mfrCheckBox.onClick = onMfrCheckBoxClicked;
-
-    // Ignore Missing Dependencies GUI
+// Ignore Missing Dependencies GUI
     const ignoreMissingDepsGroup = perCompSettingsGroup.add("group", undefined, "");
     ignoreMissingDepsGroup.orientation = "column";
     ignoreMissingDepsGroup.alignment = ['fill', 'top'];
@@ -3402,8 +3346,8 @@ function buildUI(thisObj) {
             const selection = list.selection;
             perCompSettingsGroup.enabled = false;
 
-            mfrCheckBox.value = false;
-            maxCpuUsagePercentageTextBox.text = "";
+// [MFR removed]             mfrCheckBox.value = false;
+// [MFR removed]             maxCpuUsagePercentageTextBox.text = "";
             ignoreMissingDepsCheckBox.value = false;
 
             if (selection === null) {
@@ -3425,10 +3369,10 @@ function buildUI(thisObj) {
                 return;
             }
 
-            maxCpuUsagePercentageTextBox.text = settings.maxCpuUsagePercentage();
-            maxCpuUsagePercentageTextBox.onChange();
-            mfrCheckBox.value = settings.multiFrameRendering();
-            mfrCheckBox.onClick();
+// [MFR removed]             maxCpuUsagePercentageTextBox.text = settings.maxCpuUsagePercentage();
+// [MFR removed]             maxCpuUsagePercentageTextBox.onChange();
+// [MFR removed]             mfrCheckBox.value = settings.multiFrameRendering();
+// [MFR removed]             mfrCheckBox.onClick();
             ignoreMissingDepsCheckBox.value = settings.ignoreMissingDependencies();
             ignoreMissingDepsCheckBox.onClick();
         }

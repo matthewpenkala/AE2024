@@ -1,21 +1,14 @@
 # stmpo_wrapper.py
 """
-STMPO After Effects Orchestrator (Production Hardened)
+STMPO After Effects Orchestrator
 
 - Splits a single Deadline Cloud task frame range into N sub-ranges.
 - Spawns N aerender.exe processes in parallel.
-- Assigns NUMA + processor-group safe CPU affinity per process.
+- Optionally assigns CPU affinity per process based on a NUMA/CPU map.
 - Aggregates child logs into parent log with PID-prefixing.
-- Fail-fast: if any child fails, terminates siblings.
+- Fail-fast: if any child fails (and kill_on_fail is enabled), terminates siblings.
 
-V2 UPDATES:
-- Fixed Argument Logic: kill_on_fail can now be properly disabled.
-- Safety Guard: Blocks parallel rendering of single video files (.mov/.mp4).
-- Race Condition Fix: Pre-creates output directories.
-- Staggered Launch: Prevents I/O storms.
-- Recursive Kill: Cleans up zombie sub-processes.
-
-Designed for: Dual EPYC / Threadripper Windows hosts under Deadline Cloud.
+This script is invoked by call_aerender.py, not directly.
 """
 
 from __future__ import annotations
@@ -31,9 +24,6 @@ import subprocess
 import sys
 import threading
 import time
-import platform
-import ctypes
-from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -46,189 +36,13 @@ import psutil
 # -----------------------------
 
 DEFAULT_AERENDER = r"E:\DCC\Adobe\Adobe After Effects 2024\Support Files\aerender.exe"
-DEFAULT_NUMA_MAP = r"C:\Deadline\Scripts\numa_map.json"
-PROC_GROUP_SIZE = 64
+DEFAULT_NUMA_MAP = ""  # Job-attached or caller-provided path is preferred.
+HEARTBEAT_SECONDS = 30
 
-
-
-# -----------------------------
-# Windows processor-group affinity helpers
-# -----------------------------
-# On systems with >64 logical CPUs, Windows uses processor groups (max 64 logical CPUs per group).
-# psutil / SetProcessAffinityMask cannot set affinity across groups directly.
-# We therefore:
-#   1) Compute a group-local 64-bit mask for each affinity block.
-#   2) Move the child process' main thread into that group via SetThreadGroupAffinity.
-#   3) Apply the group-local mask to the process via SetProcessAffinityMask.
-#
-# On Windows 11 / Server 2022, processes span all groups by default; calling
-# SetThreadGroupAffinity intentionally restricts to a single group and sets that as primary.
-# See Microsoft Processor Groups documentation.
-_IS_WINDOWS = (os.name == "nt")
-
-if _IS_WINDOWS:
-    TH32CS_SNAPTHREAD = 0x00000004
-    THREAD_QUERY_INFORMATION = 0x0040
-    THREAD_SET_INFORMATION = 0x0020
-    PROCESS_QUERY_INFORMATION = 0x0400
-    PROCESS_SET_INFORMATION = 0x0200
-
-    class THREADENTRY32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", wintypes.DWORD),
-            ("cntUsage", wintypes.DWORD),
-            ("th32ThreadID", wintypes.DWORD),
-            ("th32OwnerProcessID", wintypes.DWORD),
-            ("tpBasePri", wintypes.LONG),
-            ("tpDeltaPri", wintypes.LONG),
-            ("dwFlags", wintypes.DWORD),
-        ]
-
-    class GROUP_AFFINITY(ctypes.Structure):
-        _fields_ = [
-            ("Mask", ctypes.c_ulonglong),
-            ("Group", wintypes.WORD),
-            ("Reserved", wintypes.WORD * 3),
-        ]
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
-    CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-
-    Thread32First = kernel32.Thread32First
-    Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
-    Thread32First.restype = wintypes.BOOL
-
-    Thread32Next = kernel32.Thread32Next
-    Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
-    Thread32Next.restype = wintypes.BOOL
-
-    OpenThread = kernel32.OpenThread
-    OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    OpenThread.restype = wintypes.HANDLE
-
-    OpenProcess = kernel32.OpenProcess
-    OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    OpenProcess.restype = wintypes.HANDLE
-
-    CloseHandle = kernel32.CloseHandle
-    CloseHandle.argtypes = [wintypes.HANDLE]
-    CloseHandle.restype = wintypes.BOOL
-
-    SetThreadGroupAffinity = getattr(kernel32, "SetThreadGroupAffinity", None)
-    if SetThreadGroupAffinity:
-        SetThreadGroupAffinity.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(GROUP_AFFINITY),
-            ctypes.POINTER(GROUP_AFFINITY),
-        ]
-        SetThreadGroupAffinity.restype = wintypes.BOOL
-
-    SetProcessAffinityMask = kernel32.SetProcessAffinityMask
-    SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_ulonglong]
-    SetProcessAffinityMask.restype = wintypes.BOOL
-
-
-    def _get_main_thread_id(pid):
-        """Best-effort: return the smallest thread id owned by pid."""
-        snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
-        if snap == wintypes.HANDLE(-1).value:
-            return None
-        try:
-            te = THREADENTRY32()
-            te.dwSize = ctypes.sizeof(THREADENTRY32)
-            ok = Thread32First(snap, ctypes.byref(te))
-            tids = []
-            while ok:
-                if te.th32OwnerProcessID == pid:
-                    tids.append(int(te.th32ThreadID))
-                ok = Thread32Next(snap, ctypes.byref(te))
-            return min(tids) if tids else None
-        finally:
-            CloseHandle(snap)
-
-
-    def _compute_group_and_mask(cpus):
-        g = int(cpus[0] // PROC_GROUP_SIZE)
-        mask = 0
-        for c in cpus:
-            cg = int(c // PROC_GROUP_SIZE)
-            if cg != g:
-                raise ValueError("Affinity block spans multiple processor groups.")
-            mask |= (1 << int(c % PROC_GROUP_SIZE))
-        return g, mask
-
-
-    def apply_group_affinity(pid, cpus, logger):
-        """Apply processor-group local affinity to pid."""
-        try:
-            group, mask = _compute_group_and_mask(cpus)
-        except Exception as ex:
-            logger.warning("Affinity plan invalid for PID %s: %s" % (pid, ex))
-            return False
-
-        tid = None
-        # Retry because very new processes may not show threads immediately.
-        for _ in range(10):
-            tid = _get_main_thread_id(pid)
-            if tid is not None:
-                break
-            time.sleep(0.05)
-
-        if tid is None:
-            logger.warning("Could not locate main thread for PID %s; skipping group affinity." % pid)
-            return False
-
-        hThread = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SET_INFORMATION, False, tid)
-        if not hThread:
-            logger.warning("OpenThread failed for TID %s (PID %s); skipping group affinity." % (tid, pid))
-            return False
-        try:
-            if SetThreadGroupAffinity:
-                ga = GROUP_AFFINITY(ctypes.c_ulonglong(mask), wintypes.WORD(group), (wintypes.WORD * 3)(0, 0, 0))
-                prev = GROUP_AFFINITY()
-                ok = SetThreadGroupAffinity(hThread, ctypes.byref(ga), ctypes.byref(prev))
-                if not ok:
-                    err = ctypes.get_last_error()
-                    logger.warning("SetThreadGroupAffinity failed for PID %s group %s err=%s." % (pid, group, err))
-                    return False
-            else:
-                logger.warning("SetThreadGroupAffinity not available on this host; skipping group affinity.")
-                return False
-        finally:
-            CloseHandle(hThread)
-
-        hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION, False, pid)
-        if not hProc:
-            logger.warning("OpenProcess failed for PID %s; skipping process mask." % pid)
-            return False
-        try:
-            ok = SetProcessAffinityMask(hProc, ctypes.c_ulonglong(mask))
-            if not ok:
-                err = ctypes.get_last_error()
-                logger.warning("SetProcessAffinityMask failed for PID %s mask=%s err=%s." % (pid, hex(mask), err))
-                return False
-        finally:
-            CloseHandle(hProc)
-
-        logger.info("Applied group affinity to PID %s: group=%s, mask=%s" % (pid, group, hex(mask)))
-        return True
-else:
-    def apply_group_affinity(pid, cpus, logger):
-        return False
 
 # -----------------------------
 # Data structures
 # -----------------------------
-
-@dataclass
-class CpuPool:
-    node_index: int
-    group_index: int
-    cpus: List[int]
-
 
 @dataclass
 class ChildProc:
@@ -240,40 +54,260 @@ class ChildProc:
 
 
 # -----------------------------
+# Utility helpers
+# -----------------------------
+
+def split_ranges(start: int, end: int, parts: int) -> List[Tuple[int, int]]:
+    total = end - start + 1
+    if parts <= 0:
+        parts = 1
+    if parts > total:
+        parts = total
+
+    base = total // parts
+    rem = total % parts
+    ranges: List[Tuple[int, int]] = []
+    cur = start
+    for i in range(parts):
+        span = base + (1 if i < rem else 0)
+        s = cur
+        e = cur + span - 1
+        ranges.append((s, e))
+        cur = e + 1
+    return ranges
+
+
+def load_numa_nodes(json_path: str) -> Dict[str, List[int]]:
+    """
+    Load a simple JSON mapping of NUMA nodes/groups to CPU indices.
+    Expected shapes that we tolerate:
+        { "0": [0,1,2,...], "1": [64,65,...] }
+        { "group_0": [0,1,...], "group_1": [64,65,...] }
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    out: Dict[str, List[int]] = {}
+    for k, v in data.items():
+        out[str(k)] = [int(x) for x in v]
+    return out
+
+
+def numa_nodes_to_pools(numa_nodes: Dict[str, List[int]]) -> List[List[int]]:
+    """
+    Convert NUMA nodes mapping into a list of CPU pools.
+    Each pool is a list of CPU indices that should be kept together.
+    """
+    pools: List[List[int]] = []
+    # Sort by numeric node id if possible, or lexicographically as fallback.
+    def key_fn(item):
+        name, _ = item
+        try:
+            return int(name.replace("group_", ""))
+        except ValueError:
+            return name
+
+    for node_id, cpus in sorted(numa_nodes.items(), key=key_fn):
+        if not cpus:
+            continue
+        pools.append(sorted(cpus))
+    return pools
+
+
+def build_affinity_blocks(concurrency: int, pools: List[List[int]]) -> List[List[int]]:
+    """
+    Build per-child affinity blocks by walking across pools and slicing CPUs.
+    This is intentionally simple and conservative; if psutil rejects a mask,
+    we just disable affinity gracefully.
+    """
+    if concurrency <= 0 or not pools:
+        return []
+
+    all_cpus: List[int] = []
+    for p in pools:
+        all_cpus.extend(p)
+
+    if not all_cpus:
+        return []
+
+    total_cpus = len(all_cpus)
+    base = total_cpus // concurrency
+    rem = total_cpus % concurrency
+    blocks: List[List[int]] = []
+
+    cur = 0
+    for i in range(concurrency):
+        span = base + (1 if i < rem else 0)
+        if span <= 0:
+            span = 1
+        slice_cpus = all_cpus[cur:cur + span]
+        if not slice_cpus:
+            slice_cpus = [all_cpus[-1]]
+        blocks.append(slice_cpus)
+        cur += span
+    return blocks
+
+
+def resolve_output(args: argparse.Namespace, concurrency: int, logger: logging.Logger) -> str:
+    """
+    Derive an output pattern; if the user specified a non-pattern video output and concurrency>1,
+    refuse parallel video rendering.
+    """
+    out = args.output
+    lower = out.lower()
+    video_exts = (".mov", ".mp4", ".avi", ".mxf", ".mkv")
+    if concurrency > 1 and lower.endswith(video_exts):
+        logger.error(
+            f"Refusing parallel render of single video file: {out} with concurrency={concurrency}. "
+            "Use an image sequence or concurrency=1 instead."
+        )
+        sys.exit(2)
+    return out
+
+
+def auto_concurrency(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """
+    Rough heuristic for AE:
+      - If MFR is disabled: concurrency ~ logical_cores / 4
+      - If MFR is enabled: concurrency ~ logical_cores / (2 * mfr_threads)
+
+    Clamped by args.max_concurrency if provided.
+    """
+    logical = psutil.cpu_count(logical=True) or 8
+    if args.disable_mfr:
+        base = max(1, logical // 4)
+    else:
+        denom = max(1, 2 * args.mfr_threads)
+        base = max(1, logical // denom)
+
+    if args.max_concurrency > 0:
+        base = min(base, args.max_concurrency)
+
+    logger.info(f"Auto concurrency chose {base} (logical={logical}, disable_mfr={args.disable_mfr})")
+    return base
+
+
+def setup_logging(log_file: Optional[str]) -> logging.Logger:
+    logger = logging.getLogger("stmpo")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    handler: logging.Handler
+    if log_file:
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+    else:
+        handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
+
+
+def stream_reader(pid: int, stream, out_q: queue.Queue, tag: str):
+    """
+    Read lines from child stream, prefix them with PID, and put into out_q.
+    """
+    for line in iter(stream.readline, ""):
+        line = line.rstrip("\n")
+        out_q.put((pid, tag, line))
+    stream.close()
+
+
+def load_env_overrides(env_file: Optional[str]) -> Dict[str, str]:
+    if not env_file:
+        return {}
+    p = Path(env_file)
+    if not p.exists():
+        return {}
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {str(k): str(v) for k, v in data.items()}
+
+
+# -----------------------------
+# Aerender command builder
+# -----------------------------
+
+def build_aerender_cmd(
+    args: argparse.Namespace,
+    s: int,
+    e: int,
+    output_pattern: str,
+) -> List[str]:
+    """
+    Build the aerender command line for a single child process.
+
+    Notes on MFR:
+    Adobe aerender expects: `-mfr mfr_flag max_cpu_percent`
+      - mfr_flag: "ON" or "OFF"
+      - max_cpu_percent: 1–100 (required even when OFF; ignored in that case)
+    """
+    cmd: List[str] = [
+        args.aerender_path,
+        "-project", args.project,
+        "-output", output_pattern,
+        "-sound", "OFF",
+        "-s", str(s),
+        "-e", str(e),
+    ]
+
+    if args.comp:
+        cmd += ["-comp", args.comp]
+    if args.rqindex is not None:
+        cmd += ["-rqindex", str(args.rqindex)]
+    if getattr(args, "rs_template", None):
+        cmd += ["-RStemplate", args.rs_template]
+    if getattr(args, "om_template", None):
+        cmd += ["-OMtemplate", args.om_template]
+
+    mfr_flag = "OFF" if args.disable_mfr else "ON"
+    max_cpu_percent = 100  # safe default; ignored when MFR is OFF
+
+    cmd += ["-mfr", mfr_flag, str(max_cpu_percent)]
+
+    return cmd
+
+
+# -----------------------------
 # Argument parsing
 # -----------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="STMPO wrapper for AE aerender parallelization on a single host."
-    )
+    p = argparse.ArgumentParser(description="STMPO After Effects Orchestrator")
 
-    # Required render inputs
-    p.add_argument("--project", required=True, help="Path to .aep project file.")
-    p.add_argument("--output", required=True,
-                   help="Output directory OR full aerender output pattern.")
-    p.add_argument("--start", type=int, required=True, help="Start frame (inclusive).")
-    p.add_argument("--end", type=int, required=True, help="End frame (inclusive).")
+    p.add_argument("--project", required=True, help="Path to .aep project")
+    p.add_argument("--comp", default=None, help="Comp name (optional if using render queue index)")
+    p.add_argument("--rqindex", type=int, default=None, help="Render queue index")
+    p.add_argument("--output", required=True, help="Output pattern")
+    p.add_argument("--start", type=int, required=True, help="Start frame")
+    p.add_argument("--end", type=int, required=True, help="End frame")
 
-    # Optional AE targeting
-    p.add_argument("--comp", default=None, help="Optional comp name.")
-    p.add_argument("--rqindex", type=int, default=None, help="Optional render queue index.")
-    p.add_argument("--rs_template", default=None, help="Optional Render Settings template.")
-    p.add_argument("--om_template", default=None, help="Optional Output Module template.")
+    p.add_argument("--concurrency", type=int, default=0, help="Number of aerender instances (0 = auto)")
+    p.add_argument("--max_concurrency", type=int, default=32, help="Upper bound on auto concurrency")
 
-    # Output control
-    p.add_argument("--output_pattern", default="[#####].png",
-                   help="Filename/pattern appended if --output is a directory.")
-    p.add_argument("--output_is_pattern", action="store_true",
-                   help="Treat --output as a full output pattern even if it looks like a directory.")
+    p.add_argument("--spawn_delay", type=float, default=2.0,
+                   help="Seconds between spawning children.")
+    p.add_argument("--child_grace_sec", type=float, default=10.0,
+                   help="Grace period when shutting down children (seconds).")
 
-    # Concurrency / resources
-    p.add_argument("--concurrency", type=int, default=-1,
-                   help=">=1 to force, -1 for auto.")
-    p.add_argument("--max_concurrency", type=int, default=48,
-                   help="Upper cap even in auto mode.")
+    p.add_argument("--kill_on_fail", action="store_true",
+                   help="If set, kill all children when any fails.")
+    p.add_argument("--no_kill_on_fail", dest="kill_on_fail", action="store_false",
+                   help="If set, do NOT kill all children on a single failure.")
+    p.set_defaults(kill_on_fail=True)
+
+    p.add_argument("--env_file", default=None,
+                   help="Optional JSON file with env overrides.")
+    p.add_argument("--log_file", default=None,
+                   help="Optional path to a log file.")
+
     p.add_argument("--ram_per_process_gb", type=float, default=10.0,
-                   help="Auto-mode RAM budget per aerender instance.")
+                   help="Auto-mode RAM budget per aerender instance (for heuristics only).")
 
     # MFR options
     p.add_argument("--mfr_threads", type=int, default=2,
@@ -285,287 +319,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aerender_path", default=DEFAULT_AERENDER,
                    help="Override path to aerender.exe.")
     p.add_argument("--numa_map", default=DEFAULT_NUMA_MAP,
-                   help="Path to numa_map.json produced from Coreinfo -n.")
+                   help="Path to numa_map.json produced from Coreinfo -n (optional).")
     p.add_argument("--disable_affinity", action="store_true",
                    help="Do not set CPU affinity.")
 
-    # Behavior / safety
-    # FIX: Logic corrected to allow disabling kill_on_fail
-    p.add_argument("--no_kill_on_fail", dest="kill_on_fail", action="store_false",
-                   help="Disable terminating siblings if a child fails (Default: kill enabled).")
-    p.set_defaults(kill_on_fail=True)
-
-    p.add_argument("--child_grace_sec", type=int, default=10,
-                   help="Seconds to wait after terminate before kill().")
-    p.add_argument("--spawn_delay", type=float, default=2.0,
-                   help="Seconds to wait between launching children to prevent I/O storms.")
-    p.add_argument("--dry_run", action="store_true",
-                   help="Print commands/affinity plan but do not execute.")
-
-    # Env + logging
-    p.add_argument("--env_file", default=None, help="Optional JSON file of env vars.")
-    p.add_argument("--log_file", default=None, help="Optional local log file path.")
+    # Optional templates (some call_aerender variants may pass these)
+    p.add_argument("--rs_template", default=None, help="Render settings template name.")
+    p.add_argument("--om_template", default=None, help="Output module template name.")
 
     return p.parse_args()
-
-
-# -----------------------------
-# Logging
-# -----------------------------
-
-def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
-    logger = logging.getLogger("STMPO")
-    
-    # FIX: Avoid duplicate handlers if re-initialized
-    if logger.handlers:
-        return logger
-        
-    logger.setLevel(logging.INFO)
-
-    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-
-    if log_file:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-
-    logger.propagate = False
-    return logger
-
-
-# -----------------------------
-# Topology / affinity planning
-# -----------------------------
-
-def load_numa_nodes(path: str) -> List[List[int]]:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"NUMA map not found: {p}")
-    data = json.loads(p.read_text(encoding="utf-8"))
-    nodes = data.get("nodes", [])
-    return [sorted(set(map(int, n))) for n in nodes]
-
-
-def numa_nodes_to_pools(numa_nodes: List[List[int]]) -> List[CpuPool]:
-    pools: List[CpuPool] = []
-    for node_i, cpus in enumerate(numa_nodes):
-        groups: Dict[int, List[int]] = {}
-        for c in cpus:
-            g = c // PROC_GROUP_SIZE
-            groups.setdefault(g, []).append(c)
-        for g, gcpus in groups.items():
-            pools.append(CpuPool(node_index=node_i, group_index=g, cpus=sorted(gcpus)))
-    return pools
-
-
-def allocate_processes_to_pools(num_procs: int, pools: List[CpuPool]) -> Dict[int, int]:
-    if num_procs <= 0: return {}
-    sizes = [len(p.cpus) for p in pools]
-    total = sum(sizes)
-    if total == 0: return {i: 0 for i in range(len(pools))}
-
-    raw = [num_procs * (s / total) for s in sizes]
-    base = [int(math.floor(r)) for r in raw]
-    remainder = num_procs - sum(base)
-
-    frac = sorted([(i, raw[i] - base[i]) for i in range(len(pools))], key=lambda x: x[1], reverse=True)
-    for i, _ in frac[:remainder]:
-        base[i] += 1
-    return {i: base[i] for i in range(len(pools))}
-
-
-def split_cpus_evenly(cpus: List[int], k: int) -> List[List[int]]:
-    if k <= 1: return [cpus]
-    n = len(cpus)
-    blocks: List[List[int]] = []
-    start = 0
-    for i in range(k):
-        end = start + math.ceil((n - start) / (k - i))
-        blocks.append(cpus[start:end])
-        start = end
-    return blocks
-
-
-def build_affinity_blocks(num_procs: int, pools: List[CpuPool]) -> List[List[int]]:
-    if num_procs <= 0: return []
-    alloc = allocate_processes_to_pools(num_procs, pools)
-    pool_blocks: List[List[List[int]]] = []
-    
-    for pool_i, pool in enumerate(pools):
-        k = alloc.get(pool_i, 0)
-        # FIX: Safety Clamp - never ask for more blocks than available CPUs
-        k = min(k, len(pool.cpus))
-        
-        if k <= 0:
-            pool_blocks.append([])
-            continue
-        pool_blocks.append(split_cpus_evenly(pool.cpus, k))
-
-    affinities: List[List[int]] = []
-    exhausted = False
-    idx = 0
-    while not exhausted and len(affinities) < num_procs:
-        exhausted = True
-        for blocks in pool_blocks:
-            if idx < len(blocks):
-                affinities.append(blocks[idx])
-                exhausted = False
-                if len(affinities) >= num_procs: break
-        idx += 1
-    return affinities[:num_procs]
-
-
-# -----------------------------
-# Concurrency & range splitting
-# -----------------------------
-
-def auto_concurrency(args: argparse.Namespace, logger: logging.Logger) -> int:
-    logical = psutil.cpu_count(logical=True) or 1
-    threads_per_proc = 1 if args.disable_mfr else max(1, args.mfr_threads)
-    cpu_cap = int((logical / threads_per_proc) * 0.90)
-    avail_gb = psutil.virtual_memory().available / (1024 ** 3)
-    mem_cap = int(avail_gb / max(0.1, args.ram_per_process_gb))
-    chosen = max(1, min(cpu_cap, mem_cap, args.max_concurrency))
-    logger.info(f"Auto concurrency: {chosen} (CPU cap:{cpu_cap}, RAM cap:{mem_cap})")
-    return chosen
-
-
-def split_ranges(start: int, end: int, n: int) -> List[Tuple[int, int]]:
-    total = end - start + 1
-    n_eff = min(n, total)
-    chunk = math.ceil(total / n_eff)
-    ranges: List[Tuple[int, int]] = []
-    cur = start
-    while cur <= end:
-        r_start = cur
-        r_end = min(end, cur + chunk - 1)
-        ranges.append((r_start, r_end))
-        cur = r_end + 1
-    return ranges
-
-
-# -----------------------------
-# Subprocess streaming
-# -----------------------------
-
-def stream_reader(pid: int, stream, out_q: queue.Queue, label: str):
-    try:
-        for line in iter(stream.readline, ""):
-            if not line: break
-            out_q.put(f"[PID {pid} {label}] {line.rstrip()}")
-    finally:
-        try: stream.close()
-        except: pass
 
 
 # -----------------------------
 # Main orchestration
 # -----------------------------
 
-def resolve_output(args: argparse.Namespace, concurrency: int, logger: logging.Logger) -> str:
-    out = args.output
-    if args.output_is_pattern:
-        return out
-
-    looks_like_pattern = ("[" in out) or ("#" in out)
-    looks_like_file = any(out.lower().endswith(ext) for ext in
-                          [".png", ".exr", ".jpg", ".jpeg", ".tif", ".tiff", ".mov", ".mp4", ".avi", ".mxf"])
-    
-    # FIX: Safety check for single movie files
-    movie_exts = (".mov", ".mp4", ".mxf", ".avi", ".webm")
-    is_movie = out.lower().endswith(movie_exts)
-    
-    if is_movie and concurrency > 1 and not looks_like_pattern:
-        logger.error("CRITICAL: Output looks like a single movie file but concurrency > 1.")
-        logger.error("Parallel rendering will corrupt the file. Use image sequences or set --concurrency 1.")
-        sys.exit(2)
-
-    if looks_like_pattern or looks_like_file:
-        return out
-    
-    # treat as directory
-    return str(Path(out) / args.output_pattern)
-
-
-def build_aerender_cmd(args: argparse.Namespace, s: int, e: int, output_pattern: str) -> List[str]:
-    cmd = [
-        args.aerender_path,
-        "-project", args.project,
-        "-output", output_pattern,
-        "-sound", "OFF",
-        "-s", str(s),
-        "-e", str(e),
-    ]
-    if args.comp: cmd += ["-comp", args.comp]
-    if args.rqindex: cmd += ["-rqindex", str(args.rqindex)]
-    if args.rs_template: cmd += ["-RStemplate", args.rs_template]
-    if args.om_template: cmd += ["-OMtemplate", args.om_template]
-    if args.disable_mfr: cmd += ["-mfr", "off"]
-    else: cmd += ["-mfr", "on", "-mfr_num_threads", str(args.mfr_threads)]
-    return cmd
-
-
-def load_env_overrides(env_file: Optional[str]) -> Dict[str, str]:
-    if not env_file: return {}
-    p = Path(env_file)
-    if not p.exists(): raise FileNotFoundError(f"env_file not found: {p}")
-    data = json.loads(p.read_text(encoding="utf-8"))
-    return {str(k): str(v) for k, v in data.items()}
-
-
-def terminate_children(children: List[ChildProc], logger: logging.Logger, grace_sec: int):
-    # 1. Gentle Terminate
-    for ch in children:
-        if ch.popen.poll() is None:
-            logger.warning(f"Terminating child PID {ch.popen.pid} ...")
-            try: ch.popen.terminate()
-            except: pass
-
-    # 2. Wait
-    deadline = time.time() + grace_sec
-    while time.time() < deadline:
-        if all(ch.popen.poll() is not None for ch in children): return
-        time.sleep(0.25)
-
-    # 3. Recursive Kill (Nuclear)
-    for ch in children:
-        if ch.popen.poll() is None:
-            logger.error(f"Force killing child PID {ch.popen.pid}...")
-            try:
-                parent = psutil.Process(ch.popen.pid)
-                for child in parent.children(recursive=True):
-                    try: child.kill()
-                    except: pass
-                parent.kill()
-            except: pass
-
-
 def main():
     args = parse_args()
     logger = setup_logging(args.log_file)
 
-    HEARTBEAT_SECONDS = 30
-
-    def log_affinity_diagnostics(ex: Exception):
-        msg = str(ex).lower()
-        if "winerror 87" in msg or "parameter is incorrect" in msg:
-            logger.warning("Affinity diagnostic: Windows rejected the CPU list (WinError 87).")
-            logger.warning("Hint: This typically happens when CPU indices span multiple processor"  \
-                           " groups. Validate numa_map.json against the host and try --disable_affinity if"  \
-                           " the map is outdated.")
-            logger.warning("Hint: psutil on Windows cannot cross processor groups. STMPO attempts group-aware pinning first; if you still see WinError 87, keep each affinity set"  \
-                           " within a single 64-core group or disable affinity.")
-        else:
-            logger.warning("Affinity diagnostic: failed to set CPU affinity; affinity attempts will be"  \
-                           " skipped for remaining children.")
-
-    if args.start > args.end:
-        logger.error(f"Invalid frame range: start={args.start} > end={args.end}")
+    # Basic validations
+    if args.end < args.start:
+        logger.error(f"Invalid frame range: start={args.start}, end={args.end}")
         sys.exit(2)
 
     proj = Path(args.project)
@@ -578,13 +353,14 @@ def main():
         logger.error(f"aerender.exe not found: {aer}")
         sys.exit(2)
 
-    requested = args.concurrency if args.concurrency >= 1 else auto_concurrency(args, logger)
     total_frames = args.end - args.start + 1
+
+    requested = args.concurrency if args.concurrency >= 1 else auto_concurrency(args, logger)
     concurrency = min(requested, total_frames)
-    
+
     output_pattern = resolve_output(args, concurrency, logger)
-    
-    # FIX: Pre-create output directory to prevent race conditions
+
+    # Pre-create output directory to prevent race conditions
     try:
         out_dir = Path(output_pattern).parent
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -594,18 +370,33 @@ def main():
     logger.info(f"Resolved output pattern: {output_pattern}")
     logger.info(f"Using concurrency={concurrency}")
 
+    # Affinity computation
     affinities: List[List[int]] = []
     if not args.disable_affinity:
         try:
-            numa_nodes = load_numa_nodes(args.numa_map)
-            pools = numa_nodes_to_pools(numa_nodes)
-            if pools:
-                affinities = build_affinity_blocks(concurrency, pools)
-                logger.info(f"Affinity active: {len(affinities)} blocks built across {len(pools)} pools.")
+            numa_path = args.numa_map
+
+            # If numa_map is not provided or blank, fall back to a job-attached
+            # numa_map.json in the same folder as this script, if present.
+            if not numa_path:
+                candidate = Path(__file__).with_name("numa_map.json")
+                if candidate.exists():
+                    numa_path = str(candidate)
+
+            if numa_path and Path(numa_path).exists():
+                numa_nodes = load_numa_nodes(numa_path)
+                pools = numa_nodes_to_pools(numa_nodes)
+                if pools:
+                    affinities = build_affinity_blocks(concurrency, pools)
+                    logger.info(f"Affinity active: {len(affinities)} blocks built across {len(pools)} pools.")
+                else:
+                    logger.warning("No CPU pools found in numa_map; affinity disabled.")
             else:
-                logger.warning("No CPU pools found; affinity disabled.")
+                if numa_path:
+                    logger.warning(f"NUMA map not found at {numa_path}; affinity disabled.")
         except Exception as e:
-            logger.error(f"Topology error: {e}. Affinity disabled.")
+            logger.error(f"Topology/affinity error: {e}. Affinity disabled.")
+
     else:
         logger.info("Affinity disabled by flag.")
 
@@ -619,18 +410,12 @@ def main():
     else:
         logger.info("No env_file provided; using process environment only.")
 
-    if args.dry_run:
-        logger.info("DRY RUN: Commands/affinities only.")
-        for i, (s, e) in enumerate(ranges):
-            cmd = build_aerender_cmd(args, s, e, output_pattern)
-            aff = affinities[i] if affinities else None
-            logger.info(f"[DRY] #{i} frames {s}-{e} aff={aff} cmd={' '.join(cmd)}")
-        sys.exit(0)
-
     stop_event = threading.Event()
+
     def on_signal(signum, frame):
         logger.warning(f"Received signal {signum}; stopping children.")
         stop_event.set()
+
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
@@ -638,21 +423,44 @@ def main():
     out_q: queue.Queue = queue.Queue()
 
     logger.info(f"Starting spawn sequence with {args.spawn_delay}s stagger delay...")
+    logger.info(
+        f"Spawn plan: {len(ranges)} children across frames {args.start}-{args.end} "
+        f"(per-child ~{math.ceil(total_frames/len(ranges))} frames)"
+    )
 
     affinity_applicable = bool(affinities) and not args.disable_affinity
-
-    logger.info(f"Spawn plan: {len(ranges)} children across frames {args.start}-{args.end} (per-child ~{math.ceil((args.end - args.start + 1)/len(ranges))} frames)")
-
     last_heartbeat = time.time()
     completion_logged = set()
 
+    # Helper to kill all children
+    def kill_all_children():
+        for ch in children:
+            if ch.popen.poll() is None:
+                try:
+                    logger.warning(f"Terminating PID {ch.popen.pid}")
+                    ch.popen.terminate()
+                except Exception as ex:
+                    logger.warning(f"Error terminating PID {ch.popen.pid}: {ex}")
+        time.sleep(args.child_grace_sec)
+        for ch in children:
+            if ch.popen.poll() is None:
+                try:
+                    logger.warning(f"Killing PID {ch.popen.pid}")
+                    ch.popen.kill()
+                except Exception as ex:
+                    logger.warning(f"Error killing PID {ch.popen.pid}: {ex}")
+
+    # Spawn children
     for i, (s, e) in enumerate(ranges):
-        if stop_event.is_set(): break
-        if i > 0 and args.spawn_delay > 0: time.sleep(args.spawn_delay)
+        if stop_event.is_set():
+            break
+        if i > 0 and args.spawn_delay > 0:
+            time.sleep(args.spawn_delay)
 
         cmd = build_aerender_cmd(args, s, e, output_pattern)
-        logger.info(f"Launching #{i} for frames {s}-{e}")
+        aff = affinities[i] if (affinity_applicable and affinities and i < len(affinities)) else None
 
+        logger.info(f"Launching #{i} for frames {s}-{e}")
         try:
             p = subprocess.Popen(
                 cmd,
@@ -662,104 +470,126 @@ def main():
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                bufsize=1
+                bufsize=1,
             )
 
-            aff = None
-            proc_handle = None
-            if affinity_applicable and affinities and i < len(affinities):
-                aff = affinities[i]
+            # Apply affinity after spawn using psutil, if requested and available.
+            if aff is not None and affinity_applicable and not args.disable_affinity:
                 try:
-                    applied = False
-                    if _IS_WINDOWS and (psutil.cpu_count(logical=True) or 0) > PROC_GROUP_SIZE:
-                        applied = apply_group_affinity(p.pid, aff, logger)
-                    if not applied:
-                        # Fallback to psutil affinity within primary group
-                        psutil.Process(p.pid).cpu_affinity(aff)
-                        applied = True
-                    if not applied:
-                        raise RuntimeError("Affinity not applied")
+                    proc_handle = psutil.Process(p.pid)
+                    proc_handle.cpu_affinity(aff)
+                    logger.info(f"Affinity applied for PID {p.pid}: {aff}")
                 except Exception as ex:
                     logger.warning(f"Affinity warning PID {p.pid}: {ex}")
-                    log_affinity_diagnostics(ex)
                     affinity_applicable = False
+                    proc_handle = None
+            else:
+                try:
+                    proc_handle = psutil.Process(p.pid)
+                except Exception:
+                    proc_handle = None
 
-            try:
-                proc_handle = psutil.Process(p.pid)
+            if proc_handle:
                 # Prime cpu_percent so later heartbeats have deltas
-                proc_handle.cpu_percent(None)
-            except Exception as ph_ex:
-                logger.debug(f"Could not attach psutil handle to PID {p.pid}: {ph_ex}")
-                proc_handle = None
+                try:
+                    proc_handle.cpu_percent(None)
+                except Exception:
+                    pass
 
-            threading.Thread(target=stream_reader, args=(p.pid, p.stdout, out_q, "LOG"), daemon=True).start()
+            threading.Thread(
+                target=stream_reader,
+                args=(p.pid, p.stdout, out_q, "LOG"),
+                daemon=True,
+            ).start()
+
             logger.info(f"Spawned PID {p.pid} frames {s}-{e} affinity={aff}")
-            children.append(ChildProc(popen=p, frame_range=(s, e), affinity=aff, psutil_proc=proc_handle, start_time=time.time()))
+            children.append(
+                ChildProc(
+                    popen=p,
+                    frame_range=(s, e),
+                    affinity=aff,
+                    psutil_proc=proc_handle,
+                    start_time=time.time(),
+                )
+            )
+
         except Exception as spawn_ex:
-            logger.error(f"Failed to spawn child #{i}: {spawn_ex}")
+            logger.error(f"Failed to spawn child for frames {s}-{e}: {spawn_ex}")
             stop_event.set()
             break
-            
-    # FIX: Explicit check if no children were spawned
+
     if not children:
-        logger.error("No children were spawned. Aborting.")
+        logger.error("No children were spawned; aborting.")
         sys.exit(1)
 
-    failed: Optional[Tuple[int, int]] = None
+    # Main loop: aggregate logs, check heartbeats, and watch exit codes.
     while True:
+        # Drain log queue
         try:
-            msg = out_q.get(timeout=0.25)
-            print(msg, flush=True)
-        except queue.Empty: pass
+            while True:
+                pid, tag, line = out_q.get_nowait()
+                logger.info(f"[PID {pid} {tag}] {line}")
+        except queue.Empty:
+            pass
 
         now = time.time()
+        # Heartbeat
         if now - last_heartbeat >= HEARTBEAT_SECONDS:
-            summaries = []
-            for ch in children:
-                pid = ch.popen.pid
-                state = "exited" if ch.popen.poll() is not None else "running"
-                runtime = now - ch.start_time
-                cpu = mem = status = None
-                if ch.psutil_proc:
-                    try:
-                        status = ch.psutil_proc.status()
-                        cpu = ch.psutil_proc.cpu_percent(None)
-                        mem_info = ch.psutil_proc.memory_info()
-                        mem = mem_info.rss / (1024 ** 2)
-                    except Exception as hb_ex:
-                        logger.debug(f"Heartbeat psutil read failed for PID {pid}: {hb_ex}")
-                summaries.append(
-                    f"PID {pid} {state} frames {ch.frame_range[0]}-{ch.frame_range[1]} "
-                    f"elapsed={runtime:.1f}s status={status} cpu%={cpu} rss_mb={mem}"
-                )
-            logger.info("Heartbeat: " + "; ".join(summaries))
             last_heartbeat = now
+            hb_lines = []
+            for ch in children:
+                rc = ch.popen.poll()
+                status = "running" if rc is None else f"exit={rc}"
+                try:
+                    cpu = ch.psutil_proc.cpu_percent(None) if ch.psutil_proc else 0.0
+                    rss_mb = (
+                        ch.psutil_proc.memory_info().rss / (1024 * 1024)
+                        if ch.psutil_proc else 0.0
+                    )
+                except Exception:
+                    cpu = 0.0
+                    rss_mb = 0.0
+                elapsed = now - ch.start_time
+                hb_lines.append(
+                    f"PID {ch.popen.pid} frames {ch.frame_range[0]}-{ch.frame_range[1]} "
+                    f"elapsed={elapsed:.1f}s status={status} cpu%={cpu:.1f} rss_mb={rss_mb:.1f}"
+                )
+            if hb_lines:
+                logger.info("Heartbeat: " + "; ".join(hb_lines))
 
-        if stop_event.is_set():
-            terminate_children(children, logger, args.child_grace_sec)
-            sys.exit(3)
-
-        alive = False
+        # Check completion / failure
+        all_done = True
+        any_failed = False
         for ch in children:
-            code = ch.popen.poll()
-            if code is None:
-                alive = True
-                continue
-            if ch.popen.pid not in completion_logged:
-                duration = time.time() - ch.start_time
-                logger.info(f"Child PID {ch.popen.pid} completed frames {ch.frame_range[0]}-{ch.frame_range[1]} with code {code} after {duration:.1f}s")
-                completion_logged.add(ch.popen.pid)
-            if code != 0 and failed is None:
-                failed = (ch.popen.pid, code)
+            rc = ch.popen.poll()
+            if rc is None:
+                all_done = False
+            else:
+                if ch.popen.pid not in completion_logged:
+                    completion_logged.add(ch.popen.pid)
+                    logger.info(
+                        f"Child PID {ch.popen.pid} completed frames "
+                        f"{ch.frame_range[0]}-{ch.frame_range[1]} with code {rc}"
+                    )
+                if rc != 0:
+                    any_failed = True
 
-        if failed and args.kill_on_fail:
-            pid, code = failed
-            logger.error(f"Child PID {pid} failed with code {code}; terminating siblings.")
-            terminate_children(children, logger, args.child_grace_sec)
+        if any_failed and args.kill_on_fail:
+            logger.error("One or more children failed; killing siblings due to kill_on_fail.")
+            kill_all_children()
+            sys.exit(1)
+
+        if all_done:
             break
 
-        if not alive: break
+        if stop_event.is_set():
+            logger.warning("Stop event set; killing all children.")
+            kill_all_children()
+            sys.exit(1)
 
+        time.sleep(1)
+
+    # Final check
     codes = [(ch.popen.pid, ch.popen.returncode) for ch in children]
     bad = [(pid, c) for pid, c in codes if c != 0]
 

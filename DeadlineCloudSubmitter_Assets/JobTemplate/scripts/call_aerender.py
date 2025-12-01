@@ -134,7 +134,7 @@ def parse_args():
     p.add_argument("--ram_per_process_gb", default="10.0")
     p.add_argument("--mfr_threads", default="2")
     p.add_argument("--disable_mfr", default="false")
-    p.add_argument("--numa_map", default=r"C:\Deadline\Scripts\numa_map.json")
+    p.add_argument("--numa_map", default="")
     p.add_argument("--disable_affinity", default="false")
     p.add_argument("--spawn_delay", default="2.0")
     p.add_argument("--child_grace_sec", default="10")
@@ -167,6 +167,17 @@ def main():
     )
 
     # Build STMPO command
+    # Resolve NUMA map path: prefer explicit, else job-attached map.
+    numa_path = args.numa_map
+    try:
+        if (not numa_path) or (not pathlib.Path(numa_path).exists()):
+            if args.job_script_dir:
+                cand = pathlib.Path(args.job_script_dir) / 'numa_map.json'
+                if cand.exists():
+                    _logger.info(f'[call_aerender] Using job-attached NUMA map: {cand}')
+                    numa_path = str(cand)
+    except Exception:
+        pass
     cmd = [
         sys.executable, str(stmpo_path),
         "--project", args.project,

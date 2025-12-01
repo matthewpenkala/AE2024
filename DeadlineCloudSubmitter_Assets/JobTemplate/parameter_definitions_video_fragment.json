@@ -72,34 +72,6 @@
       }
     },
     {
-      "name": "MultiFrameRendering",
-      "type": "STRING",
-      "default": "OFF",
-      "allowedValues": [
-        "ON",
-        "OFF"
-      ],
-      "userInterface": {
-        "control": "DROPDOWN_LIST",
-        "label": "Enable or disable multi-frame rendering",
-        "groupLabel": "Multi-Frame Rendering"
-      },
-      "description": "Multi frame rendering settings"
-    },
-    {
-      "name": "MaxCpuUsagePercentage",
-      "type": "INT",
-      "userInterface": {
-        "control": "SPIN_BOX",
-        "label": "Max CPU Usage Percentage",
-        "groupLabel": "Multi-Frame Rendering"
-      },
-      "description": "Max Cpu Percentage to use with Multi-Frame Rendering, ignored if MFR is OFF",
-      "minValue": 1,
-      "maxValue": 100,
-      "default": 90
-    },
-    {
       "name": "IgnoreMissingDependencies",
       "type": "STRING",
       "default": "OFF",
@@ -145,33 +117,9 @@
       }
     },
     {
-      "name": "MfrThreads",
-      "type": "INT",
-      "default": 4,
-      "userInterface": {
-        "control": "SPIN_BOX",
-        "label": "MFR Threads per aerender",
-        "groupLabel": "STMPO"
-      }
-    },
-    {
-      "name": "DisableMfr",
-      "type": "STRING",
-      "default": "false",
-      "allowedValues": [
-        "true",
-        "false"
-      ],
-      "userInterface": {
-        "control": "CHECK_BOX",
-        "label": "Disable MFR",
-        "groupLabel": "STMPO"
-      }
-    },
-    {
       "name": "DisableAffinity",
       "type": "STRING",
-      "default": "false",
+      "default": "true",
       "allowedValues": [
         "true",
         "false"

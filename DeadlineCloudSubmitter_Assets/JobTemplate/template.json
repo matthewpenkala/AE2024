@@ -61,29 +61,9 @@
       }
     },
     {
-      "name": "MfrThreads",
-      "type": "INT",
-      "default": 4,
-      "userInterface": {
-        "control": "SPIN_BOX",
-        "label": "MFR Threads per aerender",
-        "groupLabel": "STMPO"
-      }
-    },
-    {
-      "name": "DisableMfr",
-      "type": "STRING",
-      "default": "false",
-      "userInterface": {
-        "control": "CHECK_BOX",
-        "label": "Disable MFR",
-        "groupLabel": "STMPO"
-      }
-    },
-    {
       "name": "DisableAffinity",
       "type": "STRING",
-      "default": "false",
+      "default": "true",
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Disable CPU affinity",
