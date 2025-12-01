@@ -53,6 +53,34 @@ class ChildProc:
     start_time: float
 
 
+def summarize_proc_tree(root: psutil.Process) -> Tuple[float, float]:
+    """
+    Return (cpu_percent, rss_mb) for a process and all of its children.
+
+    cpu_percent is the sum of psutil's per-process percentages since the last
+    call to cpu_percent(None) for each process. rss_mb is total RSS in MB.
+    """
+    procs: List[psutil.Process] = [root]
+    try:
+        procs.extend(root.children(recursive=True))
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        # If we can't walk the tree, just use the root
+        pass
+
+    total_cpu = 0.0
+    total_rss_bytes = 0
+
+    for p in procs:
+        try:
+            total_cpu += p.cpu_percent(None)
+            total_rss_bytes += p.memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    rss_mb = total_rss_bytes / (1024 * 1024)
+    return total_cpu, rss_mb
+
+
 # -----------------------------
 # Utility helpers
 # -----------------------------
@@ -536,26 +564,37 @@ def main():
         # Heartbeat
         if now - last_heartbeat >= HEARTBEAT_SECONDS:
             last_heartbeat = now
-            hb_lines = []
+
+            # Sample overall worker CPU usage so we can see if the box is actually busy.
+            try:
+                system_cpu = psutil.cpu_percent(interval=0.1)
+            except Exception:
+                system_cpu = -1.0
+
+            hb_lines: List[str] = [f"system_cpu%={system_cpu:.1f}"]
+
             for ch in children:
                 rc = ch.popen.poll()
                 status = "running" if rc is None else f"exit={rc}"
-                try:
-                    cpu = ch.psutil_proc.cpu_percent(None) if ch.psutil_proc else 0.0
-                    rss_mb = (
-                        ch.psutil_proc.memory_info().rss / (1024 * 1024)
-                        if ch.psutil_proc else 0.0
-                    )
-                except Exception:
-                    cpu = 0.0
-                    rss_mb = 0.0
+
+                tree_cpu = 0.0
+                tree_rss_mb = 0.0
+
+                if ch.psutil_proc:
+                    try:
+                        tree_cpu, tree_rss_mb = summarize_proc_tree(ch.psutil_proc)
+                    except Exception:
+                        tree_cpu = 0.0
+                        tree_rss_mb = 0.0
+
                 elapsed = now - ch.start_time
                 hb_lines.append(
                     f"PID {ch.popen.pid} frames {ch.frame_range[0]}-{ch.frame_range[1]} "
-                    f"elapsed={elapsed:.1f}s status={status} cpu%={cpu:.1f} rss_mb={rss_mb:.1f}"
+                    f"elapsed={elapsed:.1f}s status={status} "
+                    f"tree_cpu%={tree_cpu:.1f} tree_rss_mb={tree_rss_mb:.1f}"
                 )
-            if hb_lines:
-                logger.info("Heartbeat: " + "; ".join(hb_lines))
+
+            logger.info("Heartbeat: " + "; ".join(hb_lines))
 
         # Check completion / failure
         all_done = True

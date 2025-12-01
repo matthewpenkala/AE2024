@@ -49,30 +49,29 @@
       "userInterface": {
         "control": "CHOOSE_DIRECTORY",
         "label": "Output Directory",
-        "groupLabel": "Render Parameters"
+        "groupLabel": "Output"
       },
-      "default": "./output",
-      "description": "Choose the render output directory."
+      "description": "The directory to write the output files to."
     },
     {
       "name": "OutputFileName",
       "type": "STRING",
       "userInterface": {
-        "control": "HIDDEN",
-        "label": "Output File Pattern",
-        "groupLabel": "Render Parameters"
+        "control": "TEXT_BOX",
+        "label": "Output File Name",
+        "groupLabel": "Output"
       },
-      "default": "output_####.png",
-      "description": "The file name used for aerender cmd. Not a changeable parameter."
+      "description": "The file name to use for the output images (e.g. comp_[#####].png)."
     },
     {
       "name": "Frames",
       "type": "STRING",
       "userInterface": {
-        "control": "LINE_EDIT",
-        "label": "Start Frame - End Frame",
-        "groupLabel": "Frame Range"
-      }
+        "control": "TEXT_BOX",
+        "label": "Frame Range",
+        "groupLabel": "Output"
+      },
+      "description": "The frame range to render (e.g. 0-100)."
     },
     {
       "name": "IgnoreMissingDependencies",
@@ -83,8 +82,8 @@
         "OFF"
       ],
       "userInterface": {
-        "control": "DROPDOWN_LIST",
-        "label": "Ignore Missing Dependencies",
+        "control": "CHECK_BOX",
+        "label": "Ignore missing dependencies",
         "groupLabel": "Ignore Missing Dependencies"
       },
       "description": "Allows render to continue without failing if referenced files are missing."
@@ -92,7 +91,7 @@
     {
       "name": "Concurrency",
       "type": "INT",
-      "default": 32,
+      "default": -1,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "STMPO Concurrency (-1=auto)",
@@ -123,6 +122,10 @@
       "name": "DisableAffinity",
       "type": "STRING",
       "default": "true",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Disable CPU affinity",
@@ -153,9 +156,13 @@
       "name": "NoKillOnFail",
       "type": "STRING",
       "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
-        "label": "Don't kill siblings on fail",
+        "label": "Do NOT kill siblings on first failure",
         "groupLabel": "STMPO Advanced"
       }
     },
@@ -163,96 +170,44 @@
       "name": "OutputIsPattern",
       "type": "STRING",
       "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
-        "label": "Output is full pattern",
-        "groupLabel": "Output"
+        "label": "Output is already a pattern",
+        "groupLabel": "STMPO Advanced"
       }
     },
     {
       "name": "AerenderPath",
       "type": "STRING",
-      "default": "E:\\DCC\\Adobe\\Adobe After Effects 2024\\Support Files\\aerender.exe",
+      "default": "",
       "userInterface": {
-        "control": "HIDDEN"
-      },
-      "description": "Absolute path on the worker to aerender.exe."
+        "control": "TEXT_BOX",
+        "label": "Custom aerender.exe path (optional)",
+        "groupLabel": "Advanced Paths"
+      }
     },
     {
       "name": "EnvFile",
-      "type": "PATH",
+      "type": "STRING",
       "default": "",
       "userInterface": {
-        "control": "HIDDEN"
+        "control": "TEXT_BOX",
+        "label": "Env JSON (job-attached relative or absolute)",
+        "groupLabel": "Advanced Paths"
       }
     },
     {
       "name": "LogFile",
-      "type": "PATH",
+      "type": "STRING",
       "default": "",
       "userInterface": {
-        "control": "HIDDEN"
-      }
-    },
-    {
-      "name": "JobScriptDir",
-      "description": "Directory containing embedded scripts.",
-      "userInterface": {
-        "control": "HIDDEN"
-      },
-      "type": "PATH",
-      "objectType": "DIRECTORY",
-      "dataFlow": "IN",
-      "default": "scripts"
-    },
-    {
-      "name": "CondaPackages",
-      "type": "STRING",
-      "userInterface": {
-        "control": "HIDDEN"
-      },
-      "default": "aftereffects={{AE_VERSION}}",
-      "description": "If a queue accepts this parameter, it will create a conda virtual environment from it."
-    }
-  ],
-  "jobEnvironments": [
-    {
-      "name": "Create Output Directories",
-      "description": "Create Output Directories",
-      "script": {
-        "actions": {
-          "onEnter": {
-            "command": "python",
-            "args": [
-              "{{Param.JobScriptDir}}/create_output_directory.py",
-              "{{Param.OutputDir}}"
-            ]
-          }
-        }
-      }
-    },
-    {
-      "name": "Install Fonts to Worker",
-      "description": "Install Fonts to Worker",
-      "script": {
-        "actions": {
-          "onEnter": {
-            "command": "python",
-            "args": [
-              "{{Param.JobScriptDir}}/font_manager.py",
-              "install",
-              "{{Session.WorkingDirectory}}"
-            ]
-          },
-          "onExit": {
-            "command": "python",
-            "args": [
-              "{{Param.JobScriptDir}}/font_manager.py",
-              "remove",
-              "{{Session.WorkingDirectory}}"
-            ]
-          }
-        }
+        "control": "TEXT_BOX",
+        "label": "STMPO log file path (optional)",
+        "groupLabel": "Advanced Paths"
       }
     }
   ],
@@ -266,7 +221,7 @@
             "anyOf": [
               "windows"
             ]
-          }
+          ]
         ]
       },
       "script": {
@@ -276,6 +231,8 @@
             "args": [
               "{{Param.JobScriptDir}}/call_aerender.py",
               "--deadline-cloud",
+              "--job_script_dir",
+              "{{Param.JobScriptDir}}",
               "--project",
               "{{Param.ProjectFile}}",
               "--render_queue_index",
@@ -292,8 +249,6 @@
               "{{Param.MaxConcurrency}}",
               "--ram_per_process_gb",
               "{{Param.RamPerProcessGB}}",
-              "--disable_mfr",
-              "true",
               "--disable_affinity",
               "{{Param.DisableAffinity}}",
               "--spawn_delay",

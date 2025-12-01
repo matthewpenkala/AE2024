@@ -33,7 +33,7 @@
     {
       "name": "Concurrency",
       "type": "INT",
-      "default": 32,
+      "default": -1,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "STMPO Concurrency (-1=auto)",
@@ -64,6 +64,10 @@
       "name": "DisableAffinity",
       "type": "STRING",
       "default": "true",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
         "label": "Disable CPU affinity",
@@ -94,9 +98,13 @@
       "name": "NoKillOnFail",
       "type": "STRING",
       "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
-        "label": "Don't kill siblings on fail",
+        "label": "Do NOT kill siblings on first failure",
         "groupLabel": "STMPO Advanced"
       }
     },
@@ -104,98 +112,45 @@
       "name": "OutputIsPattern",
       "type": "STRING",
       "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
       "userInterface": {
         "control": "CHECK_BOX",
-        "label": "Output is full pattern",
-        "groupLabel": "Output"
+        "label": "Output is already a pattern",
+        "groupLabel": "STMPO Advanced"
       }
     },
     {
       "name": "AerenderPath",
       "type": "STRING",
-      "default": "E:\\DCC\\Adobe\\Adobe After Effects 2024\\Support Files\\aerender.exe",
+      "default": "",
       "userInterface": {
-        "control": "HIDDEN"
-      },
-      "description": "Absolute path on the worker to aerender.exe."
+        "control": "TEXT_BOX",
+        "label": "Custom aerender.exe path (optional)",
+        "groupLabel": "Advanced Paths"
+      }
     },
     {
       "name": "EnvFile",
-      "type": "PATH",
-      "default": "__NONE__",
+      "type": "STRING",
+      "default": "",
       "userInterface": {
-        "control": "HIDDEN"
+        "control": "TEXT_BOX",
+        "label": "Env JSON (job-attached relative or absolute)",
+        "groupLabel": "Advanced Paths"
       }
     },
     {
       "name": "LogFile",
-      "type": "PATH",
-      "default": "__NONE__",
-      "userInterface": {
-        "control": "HIDDEN"
-      }
-    },
-    {
-      "name": "JobScriptDir",
-      "description": "Directory containing embedded scripts.",
-      "userInterface": {
-        "control": "HIDDEN"
-      },
-      "type": "PATH",
-      "objectType": "DIRECTORY",
-      "dataFlow": "IN",
-      "default": "scripts"
-    },
-    {
-      "name": "CondaPackages",
       "type": "STRING",
+      "default": "",
       "userInterface": {
-        "control": "HIDDEN"
-      },
-      "default": "aftereffects={{AE_VERSION}}",
-      "description": "If a queue accepts this parameter, it will create a conda virtual environment from it."
-    }
-  ],
-  "jobEnvironments": [
-    {
-      "name": "Create Output Directories",
-      "description": "Create Output Directories",
-      "script": {
-        "actions": {
-          "onEnter": {
-            "command": "python",
-            "args": [
-              "{{Param.JobScriptDir}}/create_output_directory.py",
-              "{{Param.OutputDir}}"
-            ]
-          }
-        }
-      }
-    },
-    {
-      "name": "Install Fonts to Worker",
-      "description": "Install Fonts to Worker",
-      "script": {
-        "actions": {
-          "onEnter": {
-            "command": "python",
-            "args": [
-              "{{Param.JobScriptDir}}/font_manager.py",
-              "install",
-              "{{Session.WorkingDirectory}}"
-            ]
-          },
-          "onExit": {
-            "command": "python",
-            "args": [
-              "{{Param.JobScriptDir}}/font_manager.py",
-              "remove",
-              "{{Session.WorkingDirectory}}"
-            ]
-          }
-        }
+        "control": "TEXT_BOX",
+        "label": "STMPO log file path (optional)",
+        "groupLabel": "Advanced Paths"
       }
     }
-  ],
-  "steps": []
+  ]
 }
