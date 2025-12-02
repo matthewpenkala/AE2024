@@ -111,7 +111,7 @@
     {
       "name": "RamPerProcessGB",
       "type": "FLOAT",
-      "default": 10.0,
+      "default": 110.0,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "RAM per aerender (GB)",
@@ -121,7 +121,7 @@
     {
       "name": "DisableAffinity",
       "type": "STRING",
-      "default": "true",
+      "default": "false",
       "allowedValues": [
         "true",
         "false"
