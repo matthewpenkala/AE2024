@@ -754,9 +754,12 @@ def main():
     zero_cpu_hint_emitted = False
     zero_cpu_counts: Dict[int, int] = {}
     zero_cpu_terminated: Set[int] = set()
+    render_progress: Set[int] = set()
     child_failures: Dict[int, str] = {}
     last_zero_cpu_diag: float = 0.0
     zero_cpu_global_streak = 0
+    job_failed = False
+    job_failed_logged = False
     
     while True:
         # Drain Logs (block briefly to avoid busy-wait CPU burn)
@@ -768,6 +771,9 @@ def main():
             last_log_line[pid] = line
 
             lower_line = line.lower()
+            if pid not in render_progress:
+                if "progress:" in lower_line or "starting composition" in lower_line or "finished composition" in lower_line:
+                    render_progress.add(pid)
             if pid not in child_failures:
                 if "error code: 14" in lower_line or "unexpected error occurred while exporting" in lower_line:
                     child_failures[pid] = "After Effects Error Code 14 detected"
@@ -841,9 +847,12 @@ def main():
 
                 # Detect Low CPU (Version B logic)
                 if state == "running" and cpu is not None:
-                    running_cpu_zero.append(cpu <= 0.01)
-                    if cpu <= 0.01:
-                        zero_cpu_counts[pid] = zero_cpu_counts.get(pid, 0) + 1
+                    if pid not in render_progress:
+                        running_cpu_zero.append(cpu <= 0.01)
+                        if cpu <= 0.01:
+                            zero_cpu_counts[pid] = zero_cpu_counts.get(pid, 0) + 1
+                        else:
+                            zero_cpu_counts[pid] = 0
                     else:
                         zero_cpu_counts[pid] = 0
 
@@ -870,9 +879,11 @@ def main():
             if zombie_pids:
                 logger.warning(f"Heartbeat diagnostic: Zombie renderer processes detected: {zombie_pids}")
 
-            if running_children and running_cpu_zero and all(running_cpu_zero):
+            pending_children = [ch for ch in running_children if ch.popen.pid not in render_progress]
+
+            if pending_children and running_cpu_zero and all(running_cpu_zero):
                 zero_cpu_global_streak += 1
-                zero_cpu_streak = min([zero_cpu_counts.get(ch.popen.pid, 0) for ch in running_children])
+                zero_cpu_streak = min([zero_cpu_counts.get(ch.popen.pid, 0) for ch in pending_children])
                 logger.warning(
                     "Heartbeat diagnostic: All running aerender children are currently reporting ",
                     "near-zero CPU (<= 0.01%). They may be in splash/licensing or between render phases. ",
@@ -880,7 +891,7 @@ def main():
                 )
                 if zero_cpu_streak >= 2 and now - last_zero_cpu_diag >= HEARTBEAT_SECONDS:
                     diag_lines = []
-                    for ch in running_children:
+                    for ch in pending_children:
                         pid = ch.popen.pid
                         diag_lines.append(
                             f"PID {pid}: zero_cpu_streak={zero_cpu_counts.get(pid, 0)}, "
@@ -900,26 +911,31 @@ def main():
                 # extended period while still only logging "Launching After Effects".
                 launching_only = all(
                     "launching after effects" in last_log_line.get(ch.popen.pid, "").lower()
-                    for ch in running_children
+                    for ch in pending_children
                 )
                 if (
                     launching_only
                     and zero_cpu_global_streak >= ZERO_CPU_STUCK_HEARTBEATS
-                    and now - min(ch.start_time for ch in running_children)
+                    and now - min(ch.start_time for ch in pending_children)
                     >= ZERO_CPU_STUCK_HEARTBEATS * HEARTBEAT_SECONDS
                 ):
                     logger.error(
-                        "All workers appear stuck in the After Effects splash/licensing screen "
-                        "(zero CPU and never progressed past launch). Terminating so the task "
-                        "can retry with lower concurrency or after fixing licensing."
+                        "Workers appear stuck in the After Effects splash/licensing screen "
+                        "(zero CPU and never progressed past launch). Terminating stalled workers "
+                        "so the task can retry those frames."
                     )
-                    for ch in running_children:
+                    for ch in pending_children:
+                        pid = ch.popen.pid
                         try:
-                            psutil.Process(ch.popen.pid).terminate()
+                            psutil.Process(pid).terminate()
+                            child_failures[pid] = "Stuck at launch (zero CPU heartbeats)"
+                            logger.warning(
+                                f"Heartbeat diagnostic: PID {pid} reported <=0.01% CPU for "
+                                f"{ZERO_CPU_STUCK_HEARTBEATS} consecutive heartbeats and no render progress; "
+                                "terminating to break stall."
+                            )
                         except Exception:
                             pass
-                    cleanup_resources()
-                    sys.exit(1)
             else:
                 zero_cpu_global_streak = 0
 
@@ -969,13 +985,22 @@ def main():
                 fail_rc = rc
 
         if any_failed:
-            logger.error(f"Worker PID {fail_pid} failed with RC {fail_rc}")
-            if args.kill_on_fail:
-                logger.error("kill_on_fail enabled; aborting job.")
-                cleanup_resources()
-                sys.exit(1)
+            job_failed = True
+            if not job_failed_logged:
+                logger.error(f"Worker PID {fail_pid} failed with RC {fail_rc}")
+                if args.kill_on_fail:
+                    logger.error(
+                        "kill_on_fail enabled; allowing running renders to finish but job will exit non-zero once they complete."
+                    )
+                else:
+                    logger.error("Continuing to monitor remaining workers; job will report failure when monitoring completes.")
+                job_failed_logged = True
 
         if all_done:
+            if job_failed:
+                logger.error("One or more workers failed; exiting with failure status after allowing other renders to finish.")
+                cleanup_resources()
+                sys.exit(1)
             logger.info("All render processes completed successfully.")
             break
         
