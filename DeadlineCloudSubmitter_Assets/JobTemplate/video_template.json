@@ -119,6 +119,20 @@
       }
     },
     {
+      "name": "DisableMFR",
+      "type": "STRING",
+      "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Disable Multi-Frame Rendering (MFR)",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
       "name": "DisableAffinity",
       "type": "STRING",
       "default": "true",
@@ -221,7 +235,7 @@
             "anyOf": [
               "windows"
             ]
-          ]
+          }
         ]
       },
       "script": {
@@ -249,6 +263,8 @@
               "{{Param.MaxConcurrency}}",
               "--ram_per_process_gb",
               "{{Param.RamPerProcessGB}}",
+              "--disable_mfr",
+              "{{Param.DisableMFR}}",
               "--disable_affinity",
               "{{Param.DisableAffinity}}",
               "--spawn_delay",
