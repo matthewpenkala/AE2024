@@ -537,6 +537,7 @@ def main():
             logger.info(f"Command #{i}: {' '.join(cmd)}")
 
         aff = affinities[i] if (affinities and i < len(affinities)) else None
+        applied_affinity: Optional[List[int]] = None
 
         try:
             p = subprocess.Popen(
@@ -548,11 +549,13 @@ def main():
             if aff:
                 try:
                     psutil.Process(p.pid).cpu_affinity(aff)
+                    applied_affinity = aff
                     if DEBUG_MODE:
                         logger.info(f"Set CPU affinity for PID {p.pid}: {aff}")
-                except Exception as e:
+                except Exception as aff_ex:
                     # Version A's specific error analysis
-                    log_affinity_diagnostics(logger, e, p.pid, aff)
+                    log_affinity_diagnostics(logger, aff_ex, p.pid, aff)
+                    applied_affinity = None
 
             # Attach psutil handle
             proc_handle = None
@@ -566,9 +569,9 @@ def main():
 
             threading.Thread(target=stream_reader, args=(p.pid, p.stdout, out_q, "LOG"), daemon=True).start()
 
-            children.append(ChildProc(p, (s, e), aff, proc_handle, time.time()))
+            children.append(ChildProc(p, (s, e), applied_affinity, proc_handle, time.time()))
             last_log_time[p.pid] = time.time()
-            logger.info(f"Launched Worker #{i} (PID {p.pid}) Frames {s}-{e} affinity={aff}")
+            logger.info(f"Launched Worker #{i} (PID {p.pid}) Frames {s}-{e} affinity={applied_affinity}")
 
         except Exception as ex:
             logger.error(f"Spawn failed: {ex}")
