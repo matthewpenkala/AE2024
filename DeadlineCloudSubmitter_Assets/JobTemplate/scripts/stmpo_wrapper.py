@@ -1,7 +1,6 @@
 # stmpo_wrapper.py
 """
 STMPO After Effects Orchestrator
-Merges architectural improvements from PR #11 with enhanced diagnostics.
 
 - Splits a single Deadline Cloud task frame range into N sub-ranges.
 - Spawns N aerender.exe processes in parallel.
