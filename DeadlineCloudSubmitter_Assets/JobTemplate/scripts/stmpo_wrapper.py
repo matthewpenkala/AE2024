@@ -46,10 +46,15 @@ DEFAULT_AERENDER = r"E:\DCC\Adobe\Adobe After Effects 2024\Support Files\aerende
 # NVMe Scratch Location (Ensure this drive exists and is fast)
 LOCAL_SCRATCH_ROOT = r"C:\Deadline\InterimRenderFrames"
 
-DEFAULT_NUMA_MAP = "" 
+DEFAULT_NUMA_MAP = ""
 HEARTBEAT_SECONDS = 15
 LOG_SILENCE_TIMEOUT = 300  # Seconds without log output before considering a renderer stalled
 DEBUG_MODE = os.environ.get("STMPO_DEBUG", "0") == "1" or True  # Defaulting to TRUE for dev/debug phase
+
+# Offload throttling/deprioritization
+OFFLOAD_SCAN_INTERVAL = 2.5  # seconds between scans when there is work
+OFFLOAD_BURST_LIMIT = 5  # move at most this many files per scan to keep I/O bursts short
+OFFLOAD_IDLE_INTERVAL = 5.0  # seconds between scans when nothing is pending
 
 
 # -----------------------------
@@ -261,6 +266,62 @@ def log_affinity_diagnostics(logger: logging.Logger, error: Exception, pid: int,
     logger.warning(message)
 
 
+def apply_affinity(pid: int, affinity: List[int], logger: logging.Logger, allowed_cpus: Optional[List[int]] = None) -> Optional[List[int]]:
+    """
+    Attempts to apply CPU affinity with graceful Windows fallback.
+
+    On some Windows builds with more than 64 logical CPUs, psutil delegates to
+    the legacy `SetProcessAffinityMask` API, which rejects CPU ids that span
+    processor groups and raises ``WinError 87``. When that happens, we retry
+    using only the CPUs that are currently allowed for this process (typically
+    one processor group) so the render still benefits from pinning instead of
+    outright failing.
+    """
+
+    if not affinity:
+        return None
+
+    # Deduplicate and sanitize
+    cleaned: List[int] = []
+    for cpu in affinity:
+        try:
+            cpu_id = int(cpu)
+        except (TypeError, ValueError):
+            continue
+        if cpu_id < 0:
+            continue
+        if cpu_id in cleaned:
+            continue
+        cleaned.append(cpu_id)
+
+    if not cleaned:
+        return None
+
+    try:
+        psutil.Process(pid).cpu_affinity(cleaned)
+        return cleaned
+    except OSError as ex:
+        log_affinity_diagnostics(logger, ex, pid, cleaned)
+
+        # Windows group-aware fallback: restrict to currently allowed CPUs
+        if os.name == "nt" and getattr(ex, "winerror", None) == 87 and allowed_cpus:
+            fallback = [c for c in cleaned if c in allowed_cpus]
+            if not fallback:
+                return None
+
+            try:
+                psutil.Process(pid).cpu_affinity(fallback)
+                logger.info(f"Fallback affinity for PID {pid} applied: {fallback}")
+                return fallback
+            except Exception as inner_ex:
+                log_affinity_diagnostics(logger, inner_ex, pid, fallback)
+                return None
+        return None
+    except Exception as ex:
+        log_affinity_diagnostics(logger, ex, pid, cleaned)
+        return None
+
+
 # -----------------------------
 # File Offloader (The "Sidecar")
 # -----------------------------
@@ -282,39 +343,69 @@ def is_file_stable(filepath: Path) -> bool:
 def offload_worker(local_dir: Path, remote_dir: Path, stop_event: threading.Event, logger: logging.Logger):
     """
     Watches local_dir for files. Moves them to remote_dir if they are stable.
+
+    The worker is intentionally throttled so it never competes with active renders:
+    - Processes a small burst of files, then yields for OFFLOAD_SCAN_INTERVAL seconds.
+    - When idle, sleeps longer (OFFLOAD_IDLE_INTERVAL) to keep the NAS traffic intermittent.
+    - Retries transient file locks but never blocks render scheduling/heartbeat threads.
     """
-    logger.info(f"Offloader started: {local_dir} -> {remote_dir}")
-    
+    logger.info(
+        f"Offloader started (burst_limit={OFFLOAD_BURST_LIMIT}, scan_interval={OFFLOAD_SCAN_INTERVAL}s, "
+        f"idle_interval={OFFLOAD_IDLE_INTERVAL}s): {local_dir} -> {remote_dir}"
+    )
+
     try:
         remote_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         logger.error(f"Offloader could not create remote dir {remote_dir}: {e}")
 
-    def process_files():
+    def process_files(max_files: int) -> int:
+        moved = 0
         for local_file in local_dir.glob("*"):
+            if moved >= max_files:
+                break
+
             if not local_file.is_file():
                 continue
-            
+
             if not is_file_stable(local_file):
                 continue
-            
+
             dest_path = remote_dir / local_file.name
-            
-            try:
-                shutil.copy2(local_file, dest_path)
-                os.remove(local_file)
-                logger.info(f"[Offload] Moved {local_file.name}")
-            except Exception as e:
-                logger.error(f"[Offload] Failed to move {local_file.name}: {e}")
+
+            for attempt in range(3):
+                try:
+                    shutil.copy2(local_file, dest_path)
+                    os.remove(local_file)
+                    logger.info(f"[Offload] Moved {local_file.name}")
+                    moved += 1
+                    break
+                except PermissionError as e:
+                    if attempt < 2:
+                        logger.warning(
+                            f"[Offload] File lock when moving {local_file.name} (attempt {attempt + 1}/3); retrying..."
+                        )
+                        time.sleep(0.5)
+                        continue
+                    logger.error(f"[Offload] Failed to move {local_file.name} after retries: {e}")
+                except Exception as e:
+                    logger.error(f"[Offload] Failed to move {local_file.name}: {e}")
+                    break
+        return moved
 
     while not stop_event.is_set():
-        process_files()
-        time.sleep(1.0) 
+        moved = process_files(OFFLOAD_BURST_LIMIT)
+        if moved:
+            # Short pause after a burst so render I/O stays prioritized.
+            stop_event.wait(OFFLOAD_SCAN_INTERVAL)
+        else:
+            # Nothing ready; sleep longer to keep traffic intermittent.
+            stop_event.wait(OFFLOAD_IDLE_INTERVAL)
 
     # Final Cleanup Pass
     logger.info("Offloader received stop signal. Performing final pass...")
     for _ in range(3):
-        process_files()
+        process_files(OFFLOAD_BURST_LIMIT)
         if not any(local_dir.glob("*")):
             break
         time.sleep(1)
@@ -407,6 +498,14 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     logger = setup_logging(args.log_file)
+
+    # Capture the CPUs currently available to this process (used for Windows fallbacks)
+    current_affinity: Optional[List[int]] = None
+    try:
+        current_affinity = psutil.Process().cpu_affinity()
+        logger.info(f"Current process affinity mask: {current_affinity}")
+    except Exception as aff_probe_ex:
+        logger.debug(f"Could not read current process affinity: {aff_probe_ex}")
 
     # 1. Setup Local Scratch Architecture
     # -----------------------------------
@@ -546,25 +645,9 @@ def main():
 
             # HYBRID: Robust Affinity Handling
             if aff:
-                try:
-                    psutil.Process(p.pid).cpu_affinity(aff)
-                    applied_affinity = aff
-                    if DEBUG_MODE:
-                        logger.info(f"Set CPU affinity for PID {p.pid}: {aff}")
-                except Exception as aff_ex:
-                    # Version A's specific error analysis
-                    #
-                    # NOTE:
-                    #   Do not reuse the loop variable name `e` for exception capture here.
-                    #   In Python 3, the exception variable is removed from scope after the
-                    #   except block completes (per PEP 3110).  Using the same name as
-                    #   our loop variable (which represents the end frame) shadows and
-                    #   then deletes it, leading to an `UnboundLocalError` when the
-                    #   frame range is later referenced in logs.  See:
-                    #       https://www.python.org/dev/peps/pep-3110/
-                    #   Using a unique name (`aff_ex`) avoids this bug.
-                    log_affinity_diagnostics(logger, aff_ex, p.pid, aff)
-                    applied_affinity = None
+                applied_affinity = apply_affinity(p.pid, aff, logger, allowed_cpus=current_affinity)
+                if applied_affinity and DEBUG_MODE:
+                    logger.info(f"Set CPU affinity for PID {p.pid}: {applied_affinity}")
 
             # Attach psutil handle
             proc_handle = None
@@ -593,6 +676,9 @@ def main():
     completion_logged: Set[int] = set()
     stalled_pids: Set[int] = set()
     zero_cpu_hint_emitted = False
+    zero_cpu_counts: Dict[int, int] = {}
+    zero_cpu_terminated: Set[int] = set()
+    child_failures: Dict[int, str] = {}
     
     while True:
         # Drain Logs
@@ -601,6 +687,28 @@ def main():
                 pid, tag, line = out_q.get_nowait()
                 logger.info(f"[PID {pid}] {line}")
                 last_log_time[pid] = time.time()
+
+                lower_line = line.lower()
+                if pid not in child_failures:
+                    if "error code: 14" in lower_line or "unexpected error occurred while exporting" in lower_line:
+                        child_failures[pid] = "After Effects Error Code 14 detected"
+                        logger.error(
+                            f"Detected After Effects Error Code 14 in PID {pid} output; terminating worker to force retry."
+                        )
+                        try:
+                            psutil.Process(pid).terminate()
+                        except Exception:
+                            pass
+
+                    if "could not be found" in lower_line and ".tif" in lower_line:
+                        child_failures[pid] = "Rendered frame missing on disk"
+                        logger.error(
+                            f"PID {pid} reported a missing rendered frame; terminating worker so frames can be retried."
+                        )
+                        try:
+                            psutil.Process(pid).terminate()
+                        except Exception:
+                            pass
         except queue.Empty:
             pass
 
@@ -645,6 +753,10 @@ def main():
                 # Detect Low CPU (Version B logic)
                 if state == "running" and cpu is not None:
                     running_cpu_zero.append(cpu <= 0.01)
+                    if cpu <= 0.01:
+                        zero_cpu_counts[pid] = zero_cpu_counts.get(pid, 0) + 1
+                    else:
+                        zero_cpu_counts[pid] = 0
 
                 # Detect no log output
                 last_log = last_log_time.get(pid, ch.start_time)
@@ -675,6 +787,18 @@ def main():
                     logger.warning("Hint: Re-run with --disable_affinity and a lower --concurrency value to isolate whether pinning or licensing is blocking startup.")
                     zero_cpu_hint_emitted = True
 
+            for ch in children:
+                pid = ch.popen.pid
+                if ch.popen.poll() is None and zero_cpu_counts.get(pid, 0) >= 3 and pid not in zero_cpu_terminated:
+                    zero_cpu_terminated.add(pid)
+                    logger.warning(
+                        f"Heartbeat diagnostic: PID {pid} reported <=0.01% CPU for 3 consecutive heartbeats; terminating to break stall."
+                    )
+                    try:
+                        psutil.Process(pid).terminate()
+                    except Exception:
+                        pass
+
             for stalled_pid in stalled_children:
                 if stalled_pid in stalled_pids:
                     continue
@@ -698,17 +822,22 @@ def main():
         
         for ch in children:
             rc = ch.popen.poll()
+            failure_reason = child_failures.get(ch.popen.pid)
             if rc is None:
                 all_done = False
                 continue
-            
+
             # Log completion once
             if ch.popen.pid not in completion_logged:
                 duration = time.time() - ch.start_time
                 logger.info(f"Worker PID {ch.popen.pid} completed frames {ch.frame_range[0]}-{ch.frame_range[1]} with code {rc} after {duration:.1f}s")
                 completion_logged.add(ch.popen.pid)
-            
-            if rc != 0:
+
+            if failure_reason:
+                any_failed = True
+                fail_pid = ch.popen.pid
+                fail_rc = failure_reason
+            elif rc != 0:
                 any_failed = True
                 fail_pid = ch.popen.pid
                 fail_rc = rc
