@@ -135,7 +135,7 @@ def parse_args():
     p.add_argument("--mfr_threads", default="2")
     p.add_argument("--disable_mfr", default="false")
     p.add_argument("--numa_map", default="")
-    p.add_argument("--disable_affinity", default="false")
+    p.add_argument("--disable_affinity", default="true")
     p.add_argument("--spawn_delay", default="2.0")
     p.add_argument("--child_grace_sec", default="10")
     p.add_argument("--no_kill_on_fail", default="false")
@@ -165,6 +165,17 @@ def main():
         or str(args.disable_multi_frame_rendering).upper() == "ON"
         or str(args.multi_frame_rendering).upper() == "OFF"
     )
+
+    logical_cpus = os.cpu_count() or 0
+    auto_disable_affinity = logical_cpus > 64
+    user_disable_affinity = str_to_bool(args.disable_affinity)
+    if auto_disable_affinity:
+        _logger.info(
+            f"[call_aerender] Auto-disabling affinity (logical_cpus={logical_cpus} > 64)."
+        )
+
+    disable_affinity = user_disable_affinity or auto_disable_affinity
+    enable_affinity = not disable_affinity and not auto_disable_affinity
 
     # Build STMPO command
     # Resolve NUMA map path: prefer explicit, else job-attached map.
@@ -197,8 +208,10 @@ def main():
     if disable_mfr:
         cmd += ["--disable_mfr"]
 
-    if str_to_bool(args.disable_affinity):
+    if disable_affinity:
         cmd += ["--disable_affinity"]
+    elif enable_affinity:
+        cmd += ["--enable_affinity"]
 
     if str_to_bool(args.no_kill_on_fail):
         cmd += ["--no_kill_on_fail"]

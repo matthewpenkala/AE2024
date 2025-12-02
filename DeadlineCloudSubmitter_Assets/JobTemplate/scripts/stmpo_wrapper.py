@@ -491,7 +491,25 @@ def parse_args() -> argparse.Namespace:
     
     p.add_argument("--aerender_path", default=DEFAULT_AERENDER)
     p.add_argument("--numa_map", default=DEFAULT_NUMA_MAP)
-    p.add_argument("--disable_affinity", action="store_true")
+    p.add_argument(
+        "--disable_affinity",
+        action="store_true",
+        default=True,
+        help=(
+            "Disable CPU affinity (default)."
+            " Affinity can be explicitly re-enabled with --enable_affinity."
+        ),
+    )
+    p.add_argument(
+        "--enable_affinity",
+        action="store_false",
+        dest="disable_affinity",
+        help=(
+            "Force-enable CPU affinity even though the global default is disabled."
+            " On Windows hosts with more than 64 logical CPUs, affinity may still be"
+            " constrained by processor groups."
+        ),
+    )
     
     # Optional templates
     p.add_argument("--rs_template", default=None)
@@ -504,6 +522,8 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     logger = setup_logging(args.log_file)
+
+    logical_cpus = psutil.cpu_count(logical=True) or 0
 
     # Capture the CPUs currently available to this process (used for Windows fallbacks)
     current_affinity: Optional[List[int]] = None
@@ -536,9 +556,21 @@ def main():
     requested = args.concurrency if args.concurrency >= 1 else auto_concurrency(args, logger)
     total_frames = args.end - args.start + 1
     concurrency = min(requested, total_frames)
-    
+
     logger.info(f"Orchestration: Concurrency={concurrency}, MFR={'OFF' if args.disable_mfr else 'ON'}")
     logger.info(f"Pipeline: NVMe [{local_output_path}] -> NAS [{final_output_path}]")
+
+    if args.disable_affinity and logical_cpus > 64:
+        logger.info(
+            "Affinity disabled by default on high-core host (logical_cpus=%s).",
+            logical_cpus,
+        )
+    elif args.disable_affinity:
+        logger.info(
+            "Affinity disabled by global default. Use --enable_affinity to explicitly opt back in."
+        )
+    else:
+        logger.info("Affinity explicitly enabled via --enable_affinity.")
 
     # Load NUMA/Affinity
     affinities: List[List[int]] = []
@@ -659,8 +691,8 @@ def main():
             proc_handle = None
             try:
                 proc_handle = psutil.Process(p.pid)
-                # Prime cpu_percent so later heartbeats have deltas
-                proc_handle.cpu_percent(None)
+                # Prime cpu_percent with a short sample so heartbeats are non-zero
+                proc_handle.cpu_percent(interval=0.1)
             except Exception as ph_ex:
                 logger.debug(f"Could not attach psutil handle to PID {p.pid}: {ph_ex}")
                 proc_handle = None

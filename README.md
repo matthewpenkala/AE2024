@@ -30,6 +30,7 @@ Together, they let a single Deadline task fan out into **multiple parallel `aere
   - Reads a JSON **NUMA map** (`numa_map.json`) to understand physical CPU layout.
   - Slices CPU pools into affinity blocks and pins each `aerender` child to its own block.
   - Graceful fallback: if affinity or topology fails, STMPO logs a warning and continues without pinning.
+  - Affinity is **disabled by default** (opt-in with `--enable_affinity`) and remains off by default on Windows hosts with more than **64 logical CPUs** to avoid processor-group pinning errors (`WinError 87`).
 
 - 🗂 **Job template integration**
   - OpenJD job templates for both **video** and **image sequence** renders.
