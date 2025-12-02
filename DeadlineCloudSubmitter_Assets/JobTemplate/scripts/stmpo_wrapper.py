@@ -29,7 +29,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import psutil
 
@@ -45,7 +45,7 @@ DEFAULT_AERENDER = r"E:\DCC\Adobe\Adobe After Effects 2024\Support Files\aerende
 LOCAL_SCRATCH_ROOT = r"C:\Deadline\InterimRenderFrames"
 
 DEFAULT_NUMA_MAP = "" 
-HEARTBEAT_SECONDS = 15
+HEARTBEAT_SECONDS = 30
 
 
 # -----------------------------
@@ -230,6 +230,19 @@ def load_env_overrides(env_file: Optional[str]) -> Dict[str, str]:
     with p.open("r", encoding="utf-8") as f:
         data = json.load(f)
     return {str(k): str(v) for k, v in data.items()}
+
+
+def log_affinity_diagnostics(logger: logging.Logger, error: Exception, pid: int, affinity: List[int]):
+    message = f"Failed to set CPU affinity for PID {pid} to {affinity}: {error}"
+    if isinstance(error, OSError) and getattr(error, "winerror", None) == 87:
+        message += " (WinError 87: invalid parameter; verify CPU IDs and permissions)"
+    logger.warning(message)
+
+
+def fmt_metric(value: Optional[float], precision: int = 2, suffix: str = "") -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.{precision}f}{suffix}"
 
 
 # -----------------------------
@@ -466,6 +479,16 @@ def main():
     child_env = os.environ.copy()
     child_env.update(env_overrides)
 
+    if args.env_file:
+        if env_overrides:
+            preview_items = list(env_overrides.items())
+            preview = ", ".join([f"{k}={v}" for k, v in preview_items[:5]])
+            if len(env_overrides) > 5:
+                preview += f", ... (+{len(env_overrides) - 5} more)"
+            logger.info(f"Loaded {len(env_overrides)} environment overrides from {args.env_file}. Preview: {preview}")
+        else:
+            logger.info(f"Environment file {args.env_file} provided but contained no overrides.")
+
     children: List[ChildProc] = []
     out_q: queue.Queue = queue.Queue()
     stop_children_event = threading.Event()
@@ -510,17 +533,24 @@ def main():
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 env=child_env, text=True, encoding="utf-8", errors="replace", bufsize=1
             )
-            
+
+            ps_proc: Optional[psutil.Process] = None
+            try:
+                ps_proc = psutil.Process(p.pid)
+                ps_proc.cpu_percent(None)  # Prime for future measurements
+            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                logger.warning(f"Unable to initialize psutil handle for PID {p.pid}: {e}")
+
             # Apply Affinity
             if aff:
                 try:
-                    psutil.Process(p.pid).cpu_affinity(aff)
-                except Exception:
-                    pass
-            
+                    (ps_proc or psutil.Process(p.pid)).cpu_affinity(aff)
+                except Exception as e:
+                    log_affinity_diagnostics(logger, e, p.pid, aff)
+
             threading.Thread(target=stream_reader, args=(p.pid, p.stdout, out_q, "LOG"), daemon=True).start()
-            
-            children.append(ChildProc(p, (s, e), aff, psutil.Process(p.pid), time.time()))
+
+            children.append(ChildProc(p, (s, e), aff, ps_proc, time.time()))
             logger.info(f"Launched Worker #{i} (PID {p.pid}) Frames {s}-{e}")
 
         except Exception as ex:
@@ -531,6 +561,7 @@ def main():
     # 5. Monitor Loop
     # ---------------
     last_heartbeat = time.time()
+    completion_logged: Set[int] = set()
     
     while True:
         # Drain Logs
@@ -544,8 +575,57 @@ def main():
         # Heartbeat
         if time.time() - last_heartbeat > HEARTBEAT_SECONDS:
             last_heartbeat = time.time()
-            running_count = sum(1 for c in children if c.popen.poll() is None)
-            logger.info(f"Heartbeat: {running_count}/{len(children)} workers running.")
+
+            running_children = [c for c in children if c.popen.poll() is None]
+            logger.info(f"Heartbeat: {len(running_children)}/{len(children)} workers running.")
+
+            cpu_samples: List[float] = []
+            zombie_pids: List[int] = []
+
+            for ch in children:
+                pid = ch.popen.pid
+                rc = ch.popen.poll()
+                status = "unknown"
+                cpu = None
+                rss_mb = None
+
+                if ch.psutil_proc:
+                    try:
+                        status = ch.psutil_proc.status()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        status = "unknown"
+                    try:
+                        cpu = ch.psutil_proc.cpu_percent(None)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        cpu = None
+                    try:
+                        rss_mb = ch.psutil_proc.memory_info().rss / (1024 * 1024)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        rss_mb = None
+
+                duration = time.time() - ch.start_time
+
+                logger.info(
+                    f"  PID {pid} frames {ch.frame_range[0]}-{ch.frame_range[1]} "
+                    f"status={status} cpu={fmt_metric(cpu, suffix='%')} "
+                    f"rss={fmt_metric(rss_mb, suffix='MB')} runtime={duration:.1f}s "
+                    f"rc={'...' if rc is None else rc}"
+                )
+
+                if rc is None:
+                    if cpu is not None:
+                        cpu_samples.append(cpu)
+                    if status == psutil.STATUS_ZOMBIE or status == "zombie":
+                        zombie_pids.append(pid)
+
+            if zombie_pids:
+                logger.warning(f"Detected zombie renderer processes: {zombie_pids}")
+
+            if running_children and cpu_samples and all(c <= 0.01 for c in cpu_samples):
+                logger.warning(
+                    "All running renderers reporting near-zero CPU (<= 0.01%). "
+                    "They may be stuck at the splash screen or a licensing prompt."
+                )
 
         # Check Status
         all_done = True
@@ -553,6 +633,13 @@ def main():
         
         for ch in children:
             rc = ch.popen.poll()
+            if rc is not None and ch.popen.pid not in completion_logged:
+                completion_logged.add(ch.popen.pid)
+                duration = time.time() - ch.start_time
+                logger.info(
+                    f"Worker PID {ch.popen.pid} completed frames {ch.frame_range[0]}-"
+                    f"{ch.frame_range[1]} with code {rc} after {duration:.1f}s"
+                )
             if rc is None:
                 all_done = False
             elif rc != 0:
