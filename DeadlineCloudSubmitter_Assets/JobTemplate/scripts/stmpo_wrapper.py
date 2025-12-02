@@ -829,23 +829,20 @@ def main():
                 logger.warning(f"Heartbeat diagnostic: Zombie renderer processes detected: {zombie_pids}")
 
             if running_children and running_cpu_zero and all(running_cpu_zero):
-                logger.warning("Heartbeat diagnostic: All running aerender children report near-zero CPU (<= 0.01%). They may be stuck at splash/licensing. Check After Effects UI or licensing state.")
+                logger.warning(
+                    "Heartbeat diagnostic: All running aerender children are currently reporting ",
+                    "near-zero CPU (<= 0.01%). They may be in splash/licensing or between render phases. ",
+                    "Check After Effects UI or licensing state if this persists.",
+                )
                 if not zero_cpu_hint_emitted:
-                    logger.warning("Hint: Re-run with --disable_affinity and a lower --concurrency value to isolate whether pinning or licensing is blocking startup.")
+                    logger.warning(
+                        "Hint: If this warning repeats for several minutes with no new log output, try ",
+                        "reducing --concurrency and/or disabling affinity to rule out pinning/licensing issues.",
+                    )
                     zero_cpu_hint_emitted = True
 
-            for ch in children:
-                pid = ch.popen.pid
-                if ch.popen.poll() is None and zero_cpu_counts.get(pid, 0) >= 3 and pid not in zero_cpu_terminated:
-                    zero_cpu_terminated.add(pid)
-                    logger.warning(
-                        f"Heartbeat diagnostic: PID {pid} reported <=0.01% CPU for 3 consecutive heartbeats; terminating to break stall."
-                    )
-                    try:
-                        psutil.Process(pid).terminate()
-                    except Exception:
-                        pass
-
+            # IMPORTANT: Do NOT kill workers purely on low CPU. AE can legitimately sit at low CPU between
+            # heavy phases while still making progress. Stalls are handled via log-silence detection below.
             for stalled_pid in stalled_children:
                 if stalled_pid in stalled_pids:
                     continue

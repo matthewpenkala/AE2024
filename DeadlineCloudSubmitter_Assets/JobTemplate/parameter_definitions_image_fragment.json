@@ -132,7 +132,7 @@
     {
       "name": "DisableAffinity",
       "type": "STRING",
-      "default": "true",
+      "default": "false",
       "allowedValues": [
         "true",
         "false"
