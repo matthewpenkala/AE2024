@@ -49,7 +49,8 @@ LOCAL_SCRATCH_ROOT = r"C:\Deadline\InterimRenderFrames"
 DEFAULT_NUMA_MAP = ""
 HEARTBEAT_SECONDS = 15
 LOG_SILENCE_TIMEOUT = 300  # Seconds without log output before considering a renderer stalled
-DEBUG_MODE = os.environ.get("STMPO_DEBUG", "0") == "1" or True  # Defaulting to TRUE for dev/debug phase
+# Enable extra logging only when explicitly requested via env var.
+DEBUG_MODE = os.environ.get("STMPO_DEBUG", "0") == "1"
 
 # Offload throttling/deprioritization
 OFFLOAD_SCAN_INTERVAL = 2.5  # seconds between scans when there is work
@@ -681,34 +682,43 @@ def main():
     child_failures: Dict[int, str] = {}
     
     while True:
-        # Drain Logs
+        # Drain Logs (block briefly to avoid busy-wait CPU burn)
+        time_to_heartbeat = max(0.0, HEARTBEAT_SECONDS - (time.time() - last_heartbeat))
         try:
+            pid, tag, line = out_q.get(timeout=min(0.5, time_to_heartbeat))
+            logger.info(f"[PID {pid}] {line}")
+            last_log_time[pid] = time.time()
+
+            lower_line = line.lower()
+            if pid not in child_failures:
+                if "error code: 14" in lower_line or "unexpected error occurred while exporting" in lower_line:
+                    child_failures[pid] = "After Effects Error Code 14 detected"
+                    logger.error(
+                        f"Detected After Effects Error Code 14 in PID {pid} output; terminating worker to force retry."
+                    )
+                    try:
+                        psutil.Process(pid).terminate()
+                    except Exception:
+                        pass
+
+                if "could not be found" in lower_line and ".tif" in lower_line:
+                    child_failures[pid] = "Rendered frame missing on disk"
+                    logger.error(
+                        f"PID {pid} reported a missing rendered frame; terminating worker so frames can be retried."
+                    )
+                    try:
+                        psutil.Process(pid).terminate()
+                    except Exception:
+                        pass
+
+            # Drain any remaining lines quickly without another blocking wait
             while True:
-                pid, tag, line = out_q.get_nowait()
-                logger.info(f"[PID {pid}] {line}")
-                last_log_time[pid] = time.time()
-
-                lower_line = line.lower()
-                if pid not in child_failures:
-                    if "error code: 14" in lower_line or "unexpected error occurred while exporting" in lower_line:
-                        child_failures[pid] = "After Effects Error Code 14 detected"
-                        logger.error(
-                            f"Detected After Effects Error Code 14 in PID {pid} output; terminating worker to force retry."
-                        )
-                        try:
-                            psutil.Process(pid).terminate()
-                        except Exception:
-                            pass
-
-                    if "could not be found" in lower_line and ".tif" in lower_line:
-                        child_failures[pid] = "Rendered frame missing on disk"
-                        logger.error(
-                            f"PID {pid} reported a missing rendered frame; terminating worker so frames can be retried."
-                        )
-                        try:
-                            psutil.Process(pid).terminate()
-                        except Exception:
-                            pass
+                try:
+                    pid, tag, line = out_q.get_nowait()
+                    logger.info(f"[PID {pid}] {line}")
+                    last_log_time[pid] = time.time()
+                except queue.Empty:
+                    break
         except queue.Empty:
             pass
 
@@ -857,8 +867,12 @@ def main():
             cleanup_resources()
             sys.exit(1)
         
-        # HYBRID: Faster tick (from Version B)
-        time.sleep(0.5)
+        # HYBRID: Faster tick (from Version B) without busy-waiting when quiet
+        # Block on the stop event instead of spinning so idle loops keep CPU near zero.
+        # When the log queue is busy, wake quickly; when quiet, wait longer but still
+        # bounded by the heartbeat interval so diagnostics fire on time.
+        idle_wait = 0.05 if not out_q.empty() else min(2.0, max(0.2, time_to_heartbeat))
+        stop_children_event.wait(idle_wait)
 
     # 6. Final Sync
     # -------------
