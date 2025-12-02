@@ -553,6 +553,16 @@ def main():
                         logger.info(f"Set CPU affinity for PID {p.pid}: {aff}")
                 except Exception as aff_ex:
                     # Version A's specific error analysis
+                    #
+                    # NOTE:
+                    #   Do not reuse the loop variable name `e` for exception capture here.
+                    #   In Python 3, the exception variable is removed from scope after the
+                    #   except block completes (per PEP 3110).  Using the same name as
+                    #   our loop variable (which represents the end frame) shadows and
+                    #   then deletes it, leading to an `UnboundLocalError` when the
+                    #   frame range is later referenced in logs.  See:
+                    #       https://www.python.org/dev/peps/pep-3110/
+                    #   Using a unique name (`aff_ex`) avoids this bug.
                     log_affinity_diagnostics(logger, aff_ex, p.pid, aff)
                     applied_affinity = None
 
