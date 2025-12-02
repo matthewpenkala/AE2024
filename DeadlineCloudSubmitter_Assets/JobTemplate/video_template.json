@@ -57,7 +57,7 @@
       "name": "OutputFileName",
       "type": "STRING",
       "userInterface": {
-        "control": "TEXT_BOX",
+        "control": "LINE_EDIT",
         "label": "Output File Name",
         "groupLabel": "Output"
       },
@@ -67,7 +67,7 @@
       "name": "Frames",
       "type": "STRING",
       "userInterface": {
-        "control": "TEXT_BOX",
+        "control": "LINE_EDIT",
         "label": "Frame Range",
         "groupLabel": "Output"
       },
@@ -199,7 +199,7 @@
       "type": "STRING",
       "default": "",
       "userInterface": {
-        "control": "TEXT_BOX",
+        "control": "LINE_EDIT",
         "label": "Custom aerender.exe path (optional)",
         "groupLabel": "Advanced Paths"
       }
@@ -209,7 +209,7 @@
       "type": "STRING",
       "default": "",
       "userInterface": {
-        "control": "TEXT_BOX",
+        "control": "LINE_EDIT",
         "label": "Env JSON (job-attached relative or absolute)",
         "groupLabel": "Advanced Paths"
       }
@@ -219,7 +219,7 @@
       "type": "STRING",
       "default": "",
       "userInterface": {
-        "control": "TEXT_BOX",
+        "control": "LINE_EDIT",
         "label": "STMPO log file path (optional)",
         "groupLabel": "Advanced Paths"
       }
