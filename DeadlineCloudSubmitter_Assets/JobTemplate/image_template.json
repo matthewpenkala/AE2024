@@ -135,7 +135,7 @@
     {
       "name": "DisableAffinity",
       "type": "STRING",
-      "default": "false",
+      "default": "true",
       "allowedValues": [
         "true",
         "false"
