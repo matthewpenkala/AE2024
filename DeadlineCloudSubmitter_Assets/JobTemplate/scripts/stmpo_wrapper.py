@@ -49,6 +49,7 @@ LOCAL_SCRATCH_ROOT = r"C:\Deadline\InterimRenderFrames"
 
 DEFAULT_NUMA_MAP = "" 
 HEARTBEAT_SECONDS = 15
+LOG_SILENCE_TIMEOUT = 300  # Seconds without log output before considering a renderer stalled
 DEBUG_MODE = os.environ.get("STMPO_DEBUG", "0") == "1" or True  # Defaulting to TRUE for dev/debug phase
 
 
@@ -95,13 +96,50 @@ def split_ranges(start: int, end: int, parts: int) -> List[Tuple[int, int]]:
     return ranges
 
 
-def load_numa_nodes(json_path: str) -> Dict[str, List[int]]:
+def _flatten_numa_values(value) -> List:
+    if isinstance(value, (list, tuple)):
+        flattened: List = []
+        for item in value:
+            flattened.extend(_flatten_numa_values(item))
+        return flattened
+    return [value]
+
+
+def _assert_cpu_ids_ints(cpus: List[int], logger: logging.Logger, node_name: str) -> bool:
+    if all(isinstance(cpu, int) for cpu in cpus):
+        return True
+
+    logger.warning(f"NUMA entry '{node_name}' contained non-integer CPU ids: {cpus}")
+    return False
+
+
+def load_numa_nodes(json_path: str, logger: Optional[logging.Logger] = None) -> Dict[str, List[int]]:
+    logger = logger or logging.getLogger("stmpo")
+
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     out: Dict[str, List[int]] = {}
     for k, v in data.items():
-        out[str(k)] = [int(x) for x in v]
+        node_name = str(k)
+        flattened = _flatten_numa_values(v)
+        cpus: List[int] = []
+
+        try:
+            for entry in flattened:
+                cpus.append(int(entry))
+        except (TypeError, ValueError):
+            logger.warning(f"NUMA entry '{node_name}' is malformed; affinity will be disabled for this entry.")
+            continue
+
+        if not _assert_cpu_ids_ints(cpus, logger, node_name):
+            continue
+
+        out[node_name] = cpus
+
+    if not out:
+        logger.warning("NUMA map parsed but no valid entries were found; affinity will be disabled.")
+
     return out
 
 
@@ -409,9 +447,10 @@ def main():
                     numa_path = str(candidate)
             
             if numa_path and Path(numa_path).exists():
-                numa_nodes = load_numa_nodes(numa_path)
+                numa_nodes = load_numa_nodes(numa_path, logger)
                 pools = numa_nodes_to_pools(numa_nodes)
                 if pools:
+                    logger.info(f"Parsed NUMA CPU pools: {pools}")
                     affinities = build_affinity_blocks(concurrency, pools)
                     logger.info(f"Affinity active: {len(affinities)} blocks.")
                 else:
@@ -483,9 +522,11 @@ def main():
     signal.signal(signal.SIGINT, lambda s, f: cleanup_resources())
     signal.signal(signal.SIGTERM, lambda s, f: cleanup_resources())
 
+    last_log_time: Dict[int, float] = {}
+
     for i, (s, e) in enumerate(ranges):
         if stop_children_event.is_set(): break
-        if i > 0 and args.spawn_delay > 0: 
+        if i > 0 and args.spawn_delay > 0:
             time.sleep(args.spawn_delay)
 
         cmd = build_aerender_cmd(args, s, e, str(local_output_path))
@@ -526,6 +567,7 @@ def main():
             threading.Thread(target=stream_reader, args=(p.pid, p.stdout, out_q, "LOG"), daemon=True).start()
 
             children.append(ChildProc(p, (s, e), aff, proc_handle, time.time()))
+            last_log_time[p.pid] = time.time()
             logger.info(f"Launched Worker #{i} (PID {p.pid}) Frames {s}-{e} affinity={aff}")
 
         except Exception as ex:
@@ -537,6 +579,8 @@ def main():
     # ---------------
     last_heartbeat = time.time()
     completion_logged: Set[int] = set()
+    stalled_pids: Set[int] = set()
+    zero_cpu_hint_emitted = False
     
     while True:
         # Drain Logs
@@ -544,6 +588,7 @@ def main():
             while True:
                 pid, tag, line = out_q.get_nowait()
                 logger.info(f"[PID {pid}] {line}")
+                last_log_time[pid] = time.time()
         except queue.Empty:
             pass
 
@@ -556,6 +601,7 @@ def main():
             summaries = []
             running_cpu_zero = []
             zombie_pids = []
+            stalled_children: List[int] = []
 
             for ch in children:
                 pid = ch.popen.pid
@@ -566,6 +612,8 @@ def main():
                 mem = None
                 status = "unknown"
 
+                current_affinity = ch.affinity or []
+
                 if ch.psutil_proc:
                     try:
                         status = ch.psutil_proc.status()
@@ -573,6 +621,10 @@ def main():
                         cpu = ch.psutil_proc.cpu_percent(interval=0.05)
                         mem_info = ch.psutil_proc.memory_info()
                         mem = mem_info.rss / (1024 ** 2)
+                        try:
+                            current_affinity = ch.psutil_proc.cpu_affinity()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         status = "access_denied"
                     except Exception as hb_ex:
@@ -582,6 +634,11 @@ def main():
                 if state == "running" and cpu is not None:
                     running_cpu_zero.append(cpu <= 0.01)
 
+                # Detect no log output
+                last_log = last_log_time.get(pid, ch.start_time)
+                if state == "running" and now - last_log >= LOG_SILENCE_TIMEOUT:
+                    stalled_children.append(pid)
+
                 # Detect Zombies (Version A logic)
                 if status == psutil.STATUS_ZOMBIE or status == "zombie":
                     zombie_pids.append(pid)
@@ -590,9 +647,9 @@ def main():
                 summaries.append(
                     f"PID {pid} {state} frames {ch.frame_range[0]}-{ch.frame_range[1]} "
                     f"elapsed={runtime:.1f}s status={status} cpu%={fmt_metric(cpu)} rss_mb={fmt_metric(mem)} "
-                    f"rc={rc}"
+                    f"affinity={current_affinity if current_affinity else 'none'} rc={rc}"
                 )
-            
+
             # Print multiline status
             logger.info("Heartbeat Details:\n  " + "\n  ".join(summaries))
 
@@ -601,8 +658,24 @@ def main():
                 logger.warning(f"Heartbeat diagnostic: Zombie renderer processes detected: {zombie_pids}")
 
             if running_children and running_cpu_zero and all(running_cpu_zero):
-                logger.warning("Heartbeat diagnostic: All running aerender children report near-zero CPU (<= 0.01%). They may be stuck at splash/licensing. Check After Effects UI or licensing state; consider lowering concurrency or disabling affinity to test.")
-            
+                logger.warning("Heartbeat diagnostic: All running aerender children report near-zero CPU (<= 0.01%). They may be stuck at splash/licensing. Check After Effects UI or licensing state.")
+                if not zero_cpu_hint_emitted:
+                    logger.warning("Hint: Re-run with --disable_affinity and a lower --concurrency value to isolate whether pinning or licensing is blocking startup.")
+                    zero_cpu_hint_emitted = True
+
+            for stalled_pid in stalled_children:
+                if stalled_pid in stalled_pids:
+                    continue
+                stalled_pids.add(stalled_pid)
+                logger.warning(
+                    f"Heartbeat diagnostic: PID {stalled_pid} produced no log output for {LOG_SILENCE_TIMEOUT}s; terminating to avoid long hangs. "
+                    "Consider relaunching with reduced concurrency if this persists."
+                )
+                try:
+                    psutil.Process(stalled_pid).terminate()
+                except Exception as stall_ex:
+                    logger.debug(f"Failed to terminate stalled PID {stalled_pid}: {stall_ex}")
+
             last_heartbeat = now
 
         # Check Status
