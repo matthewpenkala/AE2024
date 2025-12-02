@@ -135,7 +135,7 @@ def parse_args():
     p.add_argument("--mfr_threads", default="2")
     p.add_argument("--disable_mfr", default="false")
     p.add_argument("--numa_map", default="")
-    p.add_argument("--disable_affinity", default="false")
+    p.add_argument("--disable_affinity", default="true")
     p.add_argument("--spawn_delay", default="2.0")
     p.add_argument("--child_grace_sec", default="10")
     p.add_argument("--no_kill_on_fail", default="false")
