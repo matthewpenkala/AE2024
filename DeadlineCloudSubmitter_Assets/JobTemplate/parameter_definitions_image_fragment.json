@@ -116,6 +116,20 @@
       }
     },
     {
+      "name": "DisableMFR",
+      "type": "STRING",
+      "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Disable Multi-Frame Rendering (MFR)",
+        "groupLabel": "STMPO"
+      }
+    },
+    {
       "name": "DisableAffinity",
       "type": "STRING",
       "default": "true",

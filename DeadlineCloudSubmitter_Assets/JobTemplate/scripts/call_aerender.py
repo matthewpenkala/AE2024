@@ -189,7 +189,7 @@ def main():
         "--max_concurrency", str(args.max_concurrency),
         "--ram_per_process_gb", str(args.ram_per_process_gb),
         "--mfr_threads", str(args.mfr_threads),
-        "--numa_map", str(args.numa_map),
+        "--numa_map", str(numa_path),
         "--spawn_delay", str(args.spawn_delay),
         "--child_grace_sec", str(args.child_grace_sec),
     ]

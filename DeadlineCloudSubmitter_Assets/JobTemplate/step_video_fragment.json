@@ -37,6 +37,8 @@
               "{{Param.MaxConcurrency}}",
               "--ram_per_process_gb",
               "{{Param.RamPerProcessGB}}",
+              "--disable_mfr",
+              "{{Param.DisableMFR}}",
               "--disable_affinity",
               "{{Param.DisableAffinity}}",
               "--spawn_delay",
