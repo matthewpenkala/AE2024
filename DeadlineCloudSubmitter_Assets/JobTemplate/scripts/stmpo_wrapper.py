@@ -306,9 +306,14 @@ def apply_affinity(pid: int, affinity: List[int], logger: logging.Logger, allowe
 
         # Windows group-aware fallback: restrict to currently allowed CPUs
         if os.name == "nt" and getattr(ex, "winerror", None) == 87 and allowed_cpus:
+            # First try a strict intersection with the allowed set; if that is empty
+            # (common when the parent process is pinned to a single processor group
+            # but the NUMA map lists CPUs across multiple groups), fall back to the
+            # full allowed set so the child still benefits from pinning instead of
+            # failing outright.
             fallback = [c for c in cleaned if c in allowed_cpus]
             if not fallback:
-                return None
+                fallback = list(dict.fromkeys(allowed_cpus))  # preserve order, dedupe
 
             try:
                 psutil.Process(pid).cpu_affinity(fallback)
