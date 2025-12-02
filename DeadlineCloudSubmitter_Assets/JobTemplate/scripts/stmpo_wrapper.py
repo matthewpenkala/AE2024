@@ -1,12 +1,3 @@
-Here is the final, fully merged `stmpo_wrapper.py`.
-
-This script uses **Version A (PR \#11)** as the structural base (better error handling, modular functions, zombie detection) and layers on the **high-value diagnostics from Version B** (explicit command echoing, precise CPU sampling, and specific "stuck" warnings).
-
-I have also added a check for an environment variable `STMPO_DEBUG`. If set to `1`, it enables the most verbose logging (full command line echoes); otherwise, it keeps logs slightly cleaner for production.
-
-### `stmpo_wrapper.py`
-
-```python
 # stmpo_wrapper.py
 """
 STMPO After Effects Orchestrator
@@ -671,4 +662,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
