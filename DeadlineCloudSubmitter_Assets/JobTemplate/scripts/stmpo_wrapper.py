@@ -49,6 +49,10 @@ LOCAL_SCRATCH_ROOT = r"C:\Deadline\InterimRenderFrames"
 DEFAULT_NUMA_MAP = ""
 HEARTBEAT_SECONDS = 15
 LOG_SILENCE_TIMEOUT = 300  # Seconds without log output before considering a renderer stalled
+# Abort if every worker sits at zero CPU while still stuck in AE splash/licensing
+# for this many consecutive heartbeats. This protects against the "check manually"
+# scenario reported by users.
+ZERO_CPU_STUCK_HEARTBEATS = 4
 # Enable extra logging only when explicitly requested via env var.
 DEBUG_MODE = os.environ.get("STMPO_DEBUG", "0") == "1"
 
@@ -80,6 +84,39 @@ def fmt_metric(value: Optional[float], precision: int = 2, suffix: str = "") -> 
     if value is None:
         return "n/a"
     return f"{value:.{precision}f}{suffix}"
+
+
+def summarize_descendants(proc: Optional[psutil.Process]) -> str:
+    """Return a short summary of a worker's child processes for diagnostics."""
+    if not proc:
+        return "psutil handle unavailable"
+
+    try:
+        descendants = proc.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied) as ex:
+        return f"descendants unavailable: {ex}"
+    except Exception as ex:  # pragma: no cover - defensive logging only
+        return f"descendants unavailable: {ex}"
+
+    if not descendants:
+        return "no After Effects child processes detected yet"
+
+    parts: List[str] = []
+    for child in descendants:
+        try:
+            name = child.name()
+            status = child.status()
+            cpu_pct = child.cpu_percent(interval=0.0)
+            mem_info = child.memory_info()
+            parts.append(
+                f"{name}(pid={child.pid}, status={status}, cpu%={cpu_pct:.2f}, rss_mb={mem_info.rss / (1024 ** 2):.1f})"
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        except Exception as ex:  # pragma: no cover - defensive logging only
+            parts.append(f"{child.pid}: {ex}")
+
+    return "; ".join(parts) if parts else "descendants present but not readable"
 
 def split_ranges(start: int, end: int, parts: int) -> List[Tuple[int, int]]:
     total = end - start + 1
@@ -659,6 +696,7 @@ def main():
     signal.signal(signal.SIGTERM, lambda s, f: cleanup_resources())
 
     last_log_time: Dict[int, float] = {}
+    last_log_line: Dict[int, str] = {}
 
     for i, (s, e) in enumerate(ranges):
         if stop_children_event.is_set(): break
@@ -717,6 +755,8 @@ def main():
     zero_cpu_counts: Dict[int, int] = {}
     zero_cpu_terminated: Set[int] = set()
     child_failures: Dict[int, str] = {}
+    last_zero_cpu_diag: float = 0.0
+    zero_cpu_global_streak = 0
     
     while True:
         # Drain Logs (block briefly to avoid busy-wait CPU burn)
@@ -725,6 +765,7 @@ def main():
             pid, tag, line = out_q.get(timeout=min(0.5, time_to_heartbeat))
             logger.info(f"[PID {pid}] {line}")
             last_log_time[pid] = time.time()
+            last_log_line[pid] = line
 
             lower_line = line.lower()
             if pid not in child_failures:
@@ -754,6 +795,7 @@ def main():
                     pid, tag, line = out_q.get_nowait()
                     logger.info(f"[PID {pid}] {line}")
                     last_log_time[pid] = time.time()
+                    last_log_line[pid] = line
                 except queue.Empty:
                     break
         except queue.Empty:
@@ -829,17 +871,57 @@ def main():
                 logger.warning(f"Heartbeat diagnostic: Zombie renderer processes detected: {zombie_pids}")
 
             if running_children and running_cpu_zero and all(running_cpu_zero):
+                zero_cpu_global_streak += 1
+                zero_cpu_streak = min([zero_cpu_counts.get(ch.popen.pid, 0) for ch in running_children])
                 logger.warning(
                     "Heartbeat diagnostic: All running aerender children are currently reporting ",
                     "near-zero CPU (<= 0.01%). They may be in splash/licensing or between render phases. ",
                     "Check After Effects UI or licensing state if this persists.",
                 )
+                if zero_cpu_streak >= 2 and now - last_zero_cpu_diag >= HEARTBEAT_SECONDS:
+                    diag_lines = []
+                    for ch in running_children:
+                        pid = ch.popen.pid
+                        diag_lines.append(
+                            f"PID {pid}: zero_cpu_streak={zero_cpu_counts.get(pid, 0)}, "
+                            f"last_log='{last_log_line.get(pid, 'n/a')}', "
+                            f"descendants={summarize_descendants(ch.psutil_proc)}"
+                        )
+                    logger.warning("Zero-CPU detailed diagnostics:\n  " + "\n  ".join(diag_lines))
+                    last_zero_cpu_diag = now
                 if not zero_cpu_hint_emitted:
                     logger.warning(
                         "Hint: If this warning repeats for several minutes with no new log output, try ",
                         "reducing --concurrency and/or disabling affinity to rule out pinning/licensing issues.",
                     )
                     zero_cpu_hint_emitted = True
+
+                # Hard-stop the job if every worker has been stuck at zero CPU for an
+                # extended period while still only logging "Launching After Effects".
+                launching_only = all(
+                    "launching after effects" in last_log_line.get(ch.popen.pid, "").lower()
+                    for ch in running_children
+                )
+                if (
+                    launching_only
+                    and zero_cpu_global_streak >= ZERO_CPU_STUCK_HEARTBEATS
+                    and now - min(ch.start_time for ch in running_children)
+                    >= ZERO_CPU_STUCK_HEARTBEATS * HEARTBEAT_SECONDS
+                ):
+                    logger.error(
+                        "All workers appear stuck in the After Effects splash/licensing screen "
+                        "(zero CPU and never progressed past launch). Terminating so the task "
+                        "can retry with lower concurrency or after fixing licensing."
+                    )
+                    for ch in running_children:
+                        try:
+                            psutil.Process(ch.popen.pid).terminate()
+                        except Exception:
+                            pass
+                    cleanup_resources()
+                    sys.exit(1)
+            else:
+                zero_cpu_global_streak = 0
 
             # IMPORTANT: Do NOT kill workers purely on low CPU. AE can legitimately sit at low CPU between
             # heavy phases while still making progress. Stalls are handled via log-silence detection below.
