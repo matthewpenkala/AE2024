@@ -16,101 +16,55 @@ Notes:
   are preserved for backward compatibility, but are NOT used by STMPO unless you extend stmpo_wrapper.py.
 """
 
-from __future__ import annotations
-
 import argparse
-import json
 import logging
-import math
 import os
 import pathlib
-import platform
 import subprocess
 import sys
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Tuple
 
-_logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+_logger = logging.getLogger("call_aerender")
+_logger.setLevel(logging.INFO)
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_logger.addHandler(_handler)
+_logger.propagate = False
 
-# -----------------------------
-# Helpers for frame parsing
-# -----------------------------
 
-@dataclass
-class Chunk:
-    index: int
-    start_frame: int
-    end_frame: int
+def str_to_bool(val: str) -> bool:
+    return str(val).lower() in ("1", "true", "yes", "on")
 
-def parse_frames(frames_spec: str) -> List[int]:
+
+def select_task_range(frames: str, chunk_size: int, index: int) -> Tuple[int, int]:
     """
-    Parse a Deadline/OpenJD framespec like:
-      "0-99" or "0-99,120-200"
-    into a sorted unique list of ints.
+    Given the full frames string (e.g. "0-1000"), and the chunk size + index, compute
+    the subset range for this task. If chunk_size/index are None, return the full range.
     """
-    frames: List[int] = []
-    for part in frames_spec.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            start = int(a)
-            end = int(b)
-            frames.extend(range(start, end + 1))
-        else:
-            frames.append(int(part))
-    return sorted(set(frames))
-
-def build_chunks(frames: List[int], chunk_size: int) -> List[Chunk]:
-    """
-    Chunks a list of frames into sequential ranges, each up to chunk_size frames.
-    """
-    chunks: List[Chunk] = []
     if not frames:
-        return chunks
-    start = frames[0]
-    prev = start
-    count = 1
-    chunk_start = start
-    chunk_index = 0
-    for f in frames[1:]:
-        if count >= chunk_size or f != prev + 1:
-            chunks.append(Chunk(chunk_index, chunk_start, prev))
-            chunk_index += 1
-            chunk_start = f
-            count = 1
-        else:
-            count += 1
-        prev = f
-    chunks.append(Chunk(chunk_index, chunk_start, prev))
-    return chunks
+        raise ValueError("frames string cannot be empty")
+    if "-" not in frames:
+        start = end = int(frames)
+        return start, end
 
-def select_task_range(frames_spec: str, chunk_size: Optional[int], index: Optional[int]) -> Tuple[int, int]:
-    frames = parse_frames(frames_spec)
-    if not frames:
-        raise ValueError(f"No frames parsed from spec: {frames_spec}")
+    full_start_str, full_end_str = frames.split("-", 1)
+    full_start = int(full_start_str)
+    full_end = int(full_end_str)
+    if chunk_size is None or index is None:
+        return full_start, full_end
 
-    if chunk_size and index is not None:
-        chunks = build_chunks(frames, int(chunk_size))
-        match = next((c for c in chunks if c.index == int(index)), None)
-        if not match:
-            raise ValueError(f"Index {index} not found in chunks. Frames={frames_spec}, chunk_size={chunk_size}")
-        return match.start_frame, match.end_frame
+    total_frames = full_end - full_start + 1
+    chunks = max(1, (total_frames + chunk_size - 1) // chunk_size)
+    if index < 0 or index >= chunks:
+        raise ValueError(f"Invalid chunk index {index} for {chunks} chunks")
 
-    # No chunking => full range
-    return frames[0], frames[-1]
+    start = full_start + index * chunk_size
+    end = min(full_end, start + chunk_size - 1)
+    return start, end
 
-def str_to_bool(v: str) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
-# -----------------------------
-# Main
-# -----------------------------
-
-def parse_args():
-    p = argparse.ArgumentParser()
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Deadline Cloud After Effects call_aerender wrapper")
 
     # existing submitter args
     p.add_argument("--deadline-cloud", action="store_true")
@@ -121,7 +75,7 @@ def parse_args():
     p.add_argument("--index", type=int, default=None)
     p.add_argument("--render_queue_index", type=int, default=1)
     p.add_argument("--ignore_missing_dependencies", default="OFF")
-    p.add_argument("--multi-frame-rendering", default="ON")
+    p.add_argument("--multi_frame_rendering", default="ON")
     p.add_argument("--max-cpu-usage-percentage", type=int, default=90)
     p.add_argument("--graphics_memory_usage", type=int, default=100)
     p.add_argument("--disable_multi_frame_rendering", default="OFF")
@@ -130,8 +84,8 @@ def parse_args():
 
     # NEW STMPO args (values are passed as strings from OpenJD)
     p.add_argument("--concurrency", default="-1")
-    p.add_argument("--max_concurrency", default="48")
-    p.add_argument("--ram_per_process_gb", default="110.0")
+    p.add_argument("--max_concurrency", default="24")
+    p.add_argument("--ram_per_process_gb", default="32.0")
     p.add_argument("--mfr_threads", default="2")
     p.add_argument("--disable_mfr", default="false")
     p.add_argument("--numa_map", default="")
@@ -145,6 +99,7 @@ def parse_args():
     p.add_argument("--log_file", default=None)
 
     return p.parse_args()
+
 
 def main():
     args = parse_args()
@@ -190,7 +145,8 @@ def main():
     except Exception:
         pass
     cmd = [
-        sys.executable, str(stmpo_path),
+        sys.executable,
+        str(stmpo_path),
         "--project", args.project,
         "--rqindex", str(args.render_queue_index),
         "--output", args.output,

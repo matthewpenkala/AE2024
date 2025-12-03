@@ -16,77 +16,63 @@
               "*.aep",
               "*.aepx"
             ]
-          },
-          {
-            "label": "All Files",
-            "patterns": [
-              "*"
-            ]
           }
         ]
-      },
-      "description": "The After Effects project file to render."
+      }
+    },
+    {
+      "name": "CompName",
+      "type": "STRING",
+      "default": "",
+      "userInterface": {
+        "control": "LINE_EDIT",
+        "label": "Comp name (optional)",
+        "groupLabel": "Source"
+      }
     },
     {
       "name": "RenderQueueIndex",
       "type": "INT",
+      "default": 1,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "Render Queue Index",
         "groupLabel": "Source"
-      },
-      "description": "The index of the item in the render queue to render.",
-      "default": 1
+      }
     },
     {
-      "name": "OutputDir",
+      "name": "OutputPath",
       "type": "PATH",
-      "objectType": "DIRECTORY",
+      "objectType": "FILE",
       "dataFlow": "OUT",
       "userInterface": {
-        "control": "CHOOSE_DIRECTORY",
-        "label": "Output Directory",
+        "control": "CHOOSE_OUTPUT_FILE",
+        "label": "Output path (image sequence)",
         "groupLabel": "Output"
-      },
-      "description": "The directory to write the output files to."
+      }
     },
     {
-      "name": "OutputFileName",
+      "name": "FrameRange",
       "type": "STRING",
+      "default": "0-100",
       "userInterface": {
         "control": "LINE_EDIT",
-        "label": "Output File Name",
-        "groupLabel": "Output"
-      },
-      "description": "The file name to use for the output images (e.g. comp_[#####].png)."
+        "label": "Frame range (start-end)",
+        "groupLabel": "Frame Range"
+      }
     },
     {
-      "name": "Frames",
-      "type": "STRING",
+      "name": "ChunkSize",
+      "type": "INT",
+      "default": 0,
       "userInterface": {
-        "control": "LINE_EDIT",
-        "label": "Frame Range",
-        "groupLabel": "Output"
-      },
-      "description": "The frame range to render (e.g. 0-100)."
+        "control": "SPIN_BOX",
+        "label": "Chunk size (0=full range)",
+        "groupLabel": "Frame Range"
+      }
     },
     {
-      "name": "IgnoreMissingDependencies",
-      "type": "STRING",
-      "default": "OFF",
-      "allowedValues": [
-        "ON",
-        "OFF"
-      ],
-      "userInterface": {
-        "control": "CHECK_BOX",
-        "label": "Ignore missing dependencies",
-        "groupLabel": "Ignore Missing Dependencies"
-      },
-      "description": "Allows render to continue without failing if referenced files are missing."
-    },
-    {
-      "name": "Concurrency",
+      "name": "STMPOConcurrency",
       "type": "INT",
       "default": -1,
       "userInterface": {
@@ -98,7 +84,7 @@
     {
       "name": "MaxConcurrency",
       "type": "INT",
-      "default": 48,
+      "default": 24,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "STMPO Max Concurrency",
@@ -108,7 +94,7 @@
     {
       "name": "RamPerProcessGB",
       "type": "FLOAT",
-      "default": 110.0,
+      "default": 32.0,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "RAM per aerender (GB)",
@@ -164,50 +150,12 @@
       }
     },
     {
-      "name": "NoKillOnFail",
-      "type": "STRING",
-      "default": "false",
-      "allowedValues": [
-        "true",
-        "false"
-      ],
-      "userInterface": {
-        "control": "CHECK_BOX",
-        "label": "Do NOT kill siblings on first failure",
-        "groupLabel": "STMPO Advanced"
-      }
-    },
-    {
-      "name": "OutputIsPattern",
-      "type": "STRING",
-      "default": "false",
-      "allowedValues": [
-        "true",
-        "false"
-      ],
-      "userInterface": {
-        "control": "CHECK_BOX",
-        "label": "Output is already a pattern",
-        "groupLabel": "STMPO Advanced"
-      }
-    },
-    {
-      "name": "AerenderPath",
-      "type": "STRING",
-      "default": "",
-      "userInterface": {
-        "control": "LINE_EDIT",
-        "label": "Custom aerender.exe path (optional)",
-        "groupLabel": "Advanced Paths"
-      }
-    },
-    {
       "name": "EnvFile",
       "type": "STRING",
       "default": "",
       "userInterface": {
         "control": "LINE_EDIT",
-        "label": "Env JSON (job-attached relative or absolute)",
+        "label": "STMPO env override JSON (optional)",
         "groupLabel": "Advanced Paths"
       }
     },
