@@ -41,18 +41,27 @@
       }
     },
     {
-      "name": "OutputPath",
+      "name": "OutputDir",
       "type": "PATH",
-      "objectType": "FILE",
+      "objectType": "DIRECTORY",
       "dataFlow": "OUT",
       "userInterface": {
-        "control": "CHOOSE_OUTPUT_FILE",
-        "label": "Output path (image sequence)",
+        "control": "CHOOSE_DIRECTORY",
+        "label": "Output directory (image sequence)",
         "groupLabel": "Output"
       }
     },
     {
-      "name": "FrameRange",
+      "name": "OutputFileName",
+      "type": "STRING",
+      "userInterface": {
+        "control": "LINE_EDIT",
+        "label": "Output file name",
+        "groupLabel": "Output"
+      }
+    },
+    {
+      "name": "Frames",
       "type": "STRING",
       "default": "0-100",
       "userInterface": {
@@ -72,7 +81,21 @@
       }
     },
     {
-      "name": "STMPOConcurrency",
+      "name": "IgnoreMissingDependencies",
+      "type": "STRING",
+      "default": "OFF",
+      "allowedValues": [
+        "ON",
+        "OFF"
+      ],
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Ignore missing dependencies",
+        "groupLabel": "Ignore Missing Dependencies"
+      }
+    },
+    {
+      "name": "Concurrency",
       "type": "INT",
       "default": -1,
       "userInterface": {
@@ -84,7 +107,7 @@
     {
       "name": "MaxConcurrency",
       "type": "INT",
-      "default": 24,
+      "default": 48,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "STMPO Max Concurrency",
@@ -94,7 +117,7 @@
     {
       "name": "RamPerProcessGB",
       "type": "FLOAT",
-      "default": 32.0,
+      "default": 110.0,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "RAM per aerender (GB)",
@@ -150,12 +173,50 @@
       }
     },
     {
+      "name": "NoKillOnFail",
+      "type": "STRING",
+      "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Do NOT kill siblings on first failure",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "OutputIsPattern",
+      "type": "STRING",
+      "default": "false",
+      "allowedValues": [
+        "true",
+        "false"
+      ],
+      "userInterface": {
+        "control": "CHECK_BOX",
+        "label": "Output is already a pattern",
+        "groupLabel": "STMPO Advanced"
+      }
+    },
+    {
+      "name": "AerenderPath",
+      "type": "STRING",
+      "default": "",
+      "userInterface": {
+        "control": "LINE_EDIT",
+        "label": "Custom aerender.exe path (optional)",
+        "groupLabel": "Advanced Paths"
+      }
+    },
+    {
       "name": "EnvFile",
       "type": "STRING",
       "default": "",
       "userInterface": {
         "control": "LINE_EDIT",
-        "label": "STMPO env override JSON (optional)",
+        "label": "Env JSON (job-attached relative or absolute)",
         "groupLabel": "Advanced Paths"
       }
     },
