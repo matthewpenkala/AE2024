@@ -14,9 +14,12 @@ Usage:
   Set env var STMPO_DEBUG=1 for full command-line echoing.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -59,13 +62,16 @@ OFFLOAD_BURST_LIMIT = 5  # move at most this many files per scan to keep I/O bur
 OFFLOAD_IDLE_INTERVAL = 5.0  # seconds between scans when nothing is pending
 
 
+# -----------------------------
+# Data structures
+# -----------------------------
+
 @dataclass
-class WorkerProcess:
-    """Represents a single aerender worker and its metadata."""
+class ChildProc:
     popen: subprocess.Popen
+    frame_range: Tuple[int, int]
+    affinity: Optional[List[int]]
     psutil_proc: Optional[psutil.Process]
-    start_frame: int
-    end_frame: int
     start_time: float
 
 
@@ -93,110 +99,120 @@ def summarize_descendants(proc: Optional[psutil.Process]) -> str:
         return f"descendants unavailable: {ex}"
 
     if not descendants:
-        return "no child processes"
+        return "no After Effects child processes detected yet"
 
-    parts = []
+    parts: List[str] = []
     for child in descendants:
         try:
+            name = child.name()
+            status = child.status()
+            cpu_pct = child.cpu_percent(interval=0.0)
+            mem_info = child.memory_info()
             parts.append(
-                f"{child.pid}:{child.name()}({child.status()},cpu={fmt_metric(child.cpu_percent(None),2,'%%')},"
-                f"rss={fmt_metric(child.memory_info().rss/(1024*1024),1,'MB')})"
+                f"{name}(pid={child.pid}, status={status}, cpu%={cpu_pct:.2f}, rss_mb={mem_info.rss / (1024 ** 2):.1f})"
             )
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
         except Exception as ex:  # pragma: no cover - defensive logging only
             parts.append(f"{child.pid}: {ex}")
 
-    return "; ".join(parts)
+    return "; ".join(parts) if parts else "descendants present but not readable"
 
-
-def split_ranges(start: int, end: int, chunks: int) -> List[Tuple[int, int]]:
-    """
-    Split [start, end] inclusive into `chunks` contiguous ranges.
-
-    Example:
-      split_ranges(0, 9, 3) -> [(0, 3), (4, 7), (8, 9)]
-    """
-    if chunks <= 1:
-        return [(start, end)]
-
+def split_ranges(start: int, end: int, parts: int) -> List[Tuple[int, int]]:
     total = end - start + 1
-    base = total // chunks
-    rem = total % chunks
-    ranges: List[Tuple[int, int]] = []
+    if parts <= 0:
+        parts = 1
+    if parts > total:
+        parts = total
 
+    base = total // parts
+    rem = total % parts
+    ranges: List[Tuple[int, int]] = []
     cur = start
-    for i in range(chunks):
+    for i in range(parts):
         span = base + (1 if i < rem else 0)
-        if span <= 0:
-            span = 1
         s = cur
         e = cur + span - 1
-        if e > end:
-            e = end
         ranges.append((s, e))
         cur = e + 1
-        if cur > end:
-            break
     return ranges
 
 
-def load_numa_map(path: str) -> Dict[str, List[int]]:
-    """Load a JSON NUMA map of the form { "node0": [cpu indices], ... }."""
-    if not path:
-        return {}
-    p = Path(path)
-    if not p.exists():
-        return {}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+def _flatten_numa_values(value) -> List:
+    if isinstance(value, (list, tuple)):
+        flattened: List = []
+        for item in value:
+            flattened.extend(_flatten_numa_values(item))
+        return flattened
+    return [value]
+
+
+def _assert_cpu_ids_ints(cpus: List[int], logger: logging.Logger, node_name: str) -> bool:
+    if all(isinstance(cpu, int) for cpu in cpus):
+        return True
+
+    logger.warning(f"NUMA entry '{node_name}' contained non-integer CPU ids: {cpus}")
+    return False
+
+
+def load_numa_nodes(json_path: str, logger: Optional[logging.Logger] = None) -> Dict[str, List[int]]:
+    logger = logger or logging.getLogger("stmpo")
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
     out: Dict[str, List[int]] = {}
     for k, v in data.items():
+        node_name = str(k)
+        flattened = _flatten_numa_values(v)
+        cpus: List[int] = []
+
         try:
-            if isinstance(v, list):
-                flat: List[int] = []
-                for item in v:
-                    if isinstance(item, list):
-                        flat.extend(int(x) for x in item)
-                    else:
-                        flat.append(int(item))
-                out[str(k)] = flat
-        except Exception:
+            for entry in flattened:
+                cpus.append(int(entry))
+        except (TypeError, ValueError):
+            logger.warning(f"NUMA entry '{node_name}' is malformed; affinity will be disabled for this entry.")
             continue
+
+        if not _assert_cpu_ids_ints(cpus, logger, node_name):
+            continue
+
+        out[node_name] = cpus
+
+    if not out:
+        logger.warning("NUMA map parsed but no valid entries were found; affinity will be disabled.")
+
     return out
 
 
 def numa_nodes_to_pools(numa_nodes: Dict[str, List[int]]) -> List[List[int]]:
-    """Convert NUMA node mapping into a list of CPU pools."""
     pools: List[List[int]] = []
-    for _, cpus in sorted(numa_nodes.items()):
+    def key_fn(item):
+        name, _ = item
+        try:
+            return int(name.replace("group_", ""))
+        except ValueError:
+            return name
+
+    for node_id, cpus in sorted(numa_nodes.items(), key=key_fn):
         if not cpus:
             continue
-        uniq = sorted(set(int(c) for c in cpus))
-        pools.append(uniq)
+        pools.append(sorted(cpus))
     return pools
 
 
-def build_affinity_blocks(concurrency: int, cpu_pools: List[List[int]]) -> List[List[int]]:
-    """
-    Given concurrency and a list of CPU pools (each a list of CPU indices), build
-    a list of affinity "blocks" for each worker. Attempts to keep each worker
-    local to a small subset of CPUs across pools.
-    """
-    if concurrency <= 0 or not cpu_pools:
+def build_affinity_blocks(concurrency: int, pools: List[List[int]]) -> List[List[int]]:
+    if concurrency <= 0 or not pools:
         return []
 
     all_cpus: List[int] = []
-    for pool in cpu_pools:
-        all_cpus.extend(pool)
-    all_cpus = sorted(set(all_cpus))
+    for p in pools:
+        all_cpus.extend(p)
 
-    total_cpus = len(all_cpus)
-    if total_cpus == 0:
+    if not all_cpus:
         return []
 
+    total_cpus = len(all_cpus)
     base = total_cpus // concurrency
     rem = total_cpus % concurrency
     blocks: List[List[int]] = []
@@ -214,143 +230,25 @@ def build_affinity_blocks(concurrency: int, cpu_pools: List[List[int]]) -> List[
     return blocks
 
 
-def load_env_overrides(env_file: Optional[str]) -> Dict[str, str]:
-    if not env_file:
-        return {}
-    p = Path(env_file)
-    if not p.exists():
-        return {}
-    with p.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {str(k): str(v) for k, v in data.items()}
-
-
-def log_affinity_diagnostics(logger: logging.Logger, error: Exception, pid: int, affinity: List[int]):
-    """
-    Analyzes affinity failures, specifically looking for Windows error 87
-    (The parameter is incorrect), which occurs when the mask crosses processor
-    group boundaries on hosts with >64 logical CPUs.
-    """
-    msg = f"Failed to set affinity for PID {pid} to {affinity}: {error}"
-    logger.warning(msg)
-
-    if hasattr(error, "winerror"):
-        winerr = getattr(error, "winerror", None)
-        if winerr == 87:
-            logger.warning(
-                "WinError 87 detected while setting affinity. This often indicates that "
-                "the requested CPU mask crosses a Windows processor group boundary on a "
-                "host with more than 64 logical CPUs. Consider disabling affinity or "
-                "providing a NUMA map that aligns with processor groups."
-            )
-
-
-def apply_affinity(pid: int, affinity: List[int], logger: logging.Logger, allowed_cpus: Optional[List[int]] = None) -> Optional[List[int]]:
-    """
-    Attempt to apply affinity to PID, falling back if the requested mask is not
-    compatible with the current process group (Windows >64 logical CPUs).
-    """
-    try:
-        proc = psutil.Process(pid)
-    except Exception as ex:
-        logger.warning(f"Could not obtain psutil.Process for PID {pid}: {ex}")
-        return None
-
-    try:
-        proc.cpu_affinity(affinity)
-        return affinity
-    except Exception as ex:
-        # Attempt fallback within allowed_cpus if provided
-        log_affinity_diagnostics(logger, ex, pid, affinity)
-        if not allowed_cpus:
-            return None
-
-        # Intersect affinity with allowed CPUs
-        fallback = [c for c in affinity if c in allowed_cpus]
-        if not fallback:
-            fallback = allowed_cpus[:]
-        try:
-            proc.cpu_affinity(fallback)
-            logger.info(f"Fallback affinity for PID {pid} applied: {fallback}")
-            return fallback
-        except Exception as inner_ex:
-            log_affinity_diagnostics(logger, inner_ex, pid, fallback)
-            return None
-
-
 def auto_concurrency(args: argparse.Namespace, logger: logging.Logger) -> int:
     """
-    Heuristic for choosing a safe, high-throughput concurrency value.
-
-    Goals:
-    - Respect **RAM limits** so we don't spawn more aerender processes than memory allows.
-    - Respect **core topology** so each process gets a sensible slice of the CPU.
-    - Obey the explicit --max_concurrency cap when provided.
-
-    This is intentionally conservative – it should get you into RenderGarden-style territory
-    (a handful of very busy aerender processes) rather than "48 ghosts stuck at splash".
+    Heuristic for Concurrency.
+    Refined for High-Core Count Machines (EPYC/Threadripper).
     """
-    # CPU topology
     logical = psutil.cpu_count(logical=True) or 8
-    physical = psutil.cpu_count(logical=False) or logical
-
-    # Total RAM in GiB
-    try:
-        total_ram_gb = psutil.virtual_memory().total / float(1024 ** 3)
-    except Exception:
-        total_ram_gb = 0.0
-
-    # User hint for RAM per process (GiB). Clamp to a sane range.
-    per_gb = float(getattr(args, "ram_per_process_gb", 0.0) or 0.0)
-    if per_gb <= 0:
-        per_gb = 8.0
-    MIN_PER = 4.0
-    MAX_PER = 256.0
-    per_gb = max(MIN_PER, min(per_gb, MAX_PER))
-
-    # Safety margin so we never actually consume 100% of theoretical RAM.
-    SAFETY_MARGIN = 1.25
-
-    if total_ram_gb > 0:
-        ram_capacity = max(1, int(total_ram_gb / (per_gb * SAFETY_MARGIN)))
-    else:
-        # Fallback when psutil can't read RAM: be very conservative.
-        ram_capacity = 4
-
-    # Core-based capacity:
-    # - With MFR disabled, assume each aerender should get a few physical cores.
-    # - With MFR enabled, args.mfr_threads approximates threads-per-process.
+    
     if args.disable_mfr:
-        CORES_PER_PROC = 4  # tuned for EPYC/Threadripper-style hosts
+        # Classical AE: One core per instance roughly.
+        base = max(1, logical // 4)
     else:
-        mfr_threads = max(1, int(getattr(args, "mfr_threads", 16) or 16))
-        CORES_PER_PROC = max(1, mfr_threads)
+        # MFR Enabled:
+        target_threads_per_proc = max(16, args.mfr_threads)
+        base = max(1, logical // target_threads_per_proc)
 
-    core_capacity = max(1, physical // CORES_PER_PROC)
-
-    base = min(ram_capacity, core_capacity)
-
-    # Honor explicit max_concurrency if provided (>0).
-    if getattr(args, "max_concurrency", 0) and args.max_concurrency > 0:
+    if args.max_concurrency > 0:
         base = min(base, args.max_concurrency)
 
-    # Final clamp – never drop below 1.
-    if base < 1:
-        base = 1
-
-    logger.info(
-        "auto_concurrency: logical=%s, physical=%s, total_ram_gb=%.1f, "
-        "per_proc_ram_gb=%.1f, ram_capacity=%s, core_capacity=%s, "
-        "max_concurrency=%s, chosen=%s",
-        logical,
-        physical,
-        total_ram_gb,
-        per_gb,
-        ram_capacity,
-        core_capacity,
-        getattr(args, "max_concurrency", 0),
-        base,
-    )
+    logger.info(f"Auto concurrency chose {base} (logical={logical}, target_threads={target_threads_per_proc if not args.disable_mfr else 'N/A'})")
     return base
 
 
@@ -369,13 +267,238 @@ def setup_logging(log_file: Optional[str]) -> logging.Logger:
         handler = logging.FileHandler(log_file, encoding="utf-8")
     else:
         handler = logging.StreamHandler(sys.stdout)
-
     handler.setFormatter(formatter)
-    logger.handlers.clear()
     logger.addHandler(handler)
 
     return logger
 
+
+def stream_reader(pid: int, stream, out_q: queue.Queue, tag: str):
+    """
+    Read lines from child stream, prefix them with PID, and put into out_q.
+    """
+    for line in iter(stream.readline, ""):
+        line = line.rstrip("\n")
+        out_q.put((pid, tag, line))
+    stream.close()
+
+
+def load_env_overrides(env_file: Optional[str]) -> Dict[str, str]:
+    if not env_file:
+        return {}
+    p = Path(env_file)
+    if not p.exists():
+        return {}
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def log_affinity_diagnostics(logger: logging.Logger, error: Exception, pid: int, affinity: List[int]):
+    """
+    Analyzes affinity failures, specifically looking for Windows Error 87.
+    """
+    message = f"Failed to set CPU affinity for PID {pid} to {affinity}: {error}"
+    if isinstance(error, OSError) and getattr(error, "winerror", None) == 87:
+        message += " (WinError 87: invalid parameter; verify CPU IDs, Group assignments, and permissions)"
+    logger.warning(message)
+
+
+def apply_affinity(pid: int, affinity: List[int], logger: logging.Logger, allowed_cpus: Optional[List[int]] = None) -> Optional[List[int]]:
+    """
+    Attempts to apply CPU affinity with graceful Windows fallback.
+
+    On some Windows builds with more than 64 logical CPUs, psutil delegates to
+    the legacy `SetProcessAffinityMask` API, which rejects CPU ids that span
+    processor groups and raises ``WinError 87``. When that happens, we retry
+    using only the CPUs that are currently allowed for this process (typically
+    one processor group) so the render still benefits from pinning instead of
+    outright failing.
+    """
+
+    if not affinity:
+        return None
+
+    # Deduplicate and sanitize
+    cleaned: List[int] = []
+    for cpu in affinity:
+        try:
+            cpu_id = int(cpu)
+        except (TypeError, ValueError):
+            continue
+        if cpu_id < 0:
+            continue
+        if cpu_id in cleaned:
+            continue
+        cleaned.append(cpu_id)
+
+    if not cleaned:
+        return None
+
+    try:
+        psutil.Process(pid).cpu_affinity(cleaned)
+        return cleaned
+    except OSError as ex:
+        log_affinity_diagnostics(logger, ex, pid, cleaned)
+
+        # Windows group-aware fallback: restrict to currently allowed CPUs
+        if os.name == "nt" and getattr(ex, "winerror", None) == 87 and allowed_cpus:
+            # First try a strict intersection with the allowed set; if that is empty
+            # (common when the parent process is pinned to a single processor group
+            # but the NUMA map lists CPUs across multiple groups), fall back to the
+            # full allowed set so the child still benefits from pinning instead of
+            # failing outright.
+            fallback = [c for c in cleaned if c in allowed_cpus]
+            if not fallback:
+                fallback = list(dict.fromkeys(allowed_cpus))  # preserve order, dedupe
+
+            try:
+                psutil.Process(pid).cpu_affinity(fallback)
+                logger.info(f"Fallback affinity for PID {pid} applied: {fallback}")
+                return fallback
+            except Exception as inner_ex:
+                log_affinity_diagnostics(logger, inner_ex, pid, fallback)
+                return None
+        return None
+    except Exception as ex:
+        log_affinity_diagnostics(logger, ex, pid, cleaned)
+        return None
+
+
+# -----------------------------
+# File Offloader (The "Sidecar")
+# -----------------------------
+
+def is_file_stable(filepath: Path) -> bool:
+    """
+    Checks if a file is ready to be moved.
+    """
+    if not filepath.exists():
+        return False
+    try:
+        filepath.rename(filepath)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+def offload_worker(local_dir: Path, remote_dir: Path, stop_event: threading.Event, logger: logging.Logger):
+    """
+    Watches local_dir for files. Moves them to remote_dir if they are stable.
+
+    The worker is intentionally throttled so it never competes with active renders:
+    - Processes a small burst of files, then yields for OFFLOAD_SCAN_INTERVAL seconds.
+    - When idle, sleeps longer (OFFLOAD_IDLE_INTERVAL) to keep the NAS traffic intermittent.
+    - Retries transient file locks but never blocks render scheduling/heartbeat threads.
+    """
+    logger.info(
+        f"Offloader started (burst_limit={OFFLOAD_BURST_LIMIT}, scan_interval={OFFLOAD_SCAN_INTERVAL}s, "
+        f"idle_interval={OFFLOAD_IDLE_INTERVAL}s): {local_dir} -> {remote_dir}"
+    )
+
+    try:
+        remote_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.error(f"Offloader could not create remote dir {remote_dir}: {e}")
+
+    def process_files(max_files: int) -> int:
+        moved = 0
+        for local_file in local_dir.glob("*"):
+            if moved >= max_files:
+                break
+
+            if not local_file.is_file():
+                continue
+
+            if not is_file_stable(local_file):
+                continue
+
+            dest_path = remote_dir / local_file.name
+
+            for attempt in range(3):
+                try:
+                    shutil.copy2(local_file, dest_path)
+                    os.remove(local_file)
+                    logger.info(f"[Offload] Moved {local_file.name}")
+                    moved += 1
+                    break
+                except PermissionError as e:
+                    if attempt < 2:
+                        logger.warning(
+                            f"[Offload] File lock when moving {local_file.name} (attempt {attempt + 1}/3); retrying..."
+                        )
+                        time.sleep(0.5)
+                        continue
+                    logger.error(f"[Offload] Failed to move {local_file.name} after retries: {e}")
+                except Exception as e:
+                    logger.error(f"[Offload] Failed to move {local_file.name}: {e}")
+                    break
+        return moved
+
+    while not stop_event.is_set():
+        moved = process_files(OFFLOAD_BURST_LIMIT)
+        if moved:
+            # Short pause after a burst so render I/O stays prioritized.
+            stop_event.wait(OFFLOAD_SCAN_INTERVAL)
+        else:
+            # Nothing ready; sleep longer to keep traffic intermittent.
+            stop_event.wait(OFFLOAD_IDLE_INTERVAL)
+
+    # Final Cleanup Pass
+    logger.info("Offloader received stop signal. Performing final pass...")
+    for _ in range(3):
+        process_files(OFFLOAD_BURST_LIMIT)
+        if not any(local_dir.glob("*")):
+            break
+        time.sleep(1)
+
+    remaining = list(local_dir.glob("*"))
+    if remaining:
+        logger.warning(f"Offloader finishing with {len(remaining)} files left in scratch (likely stuck/locked): {remaining}")
+    else:
+        logger.info("Offloader finished clean.")
+
+
+# -----------------------------
+# Aerender command builder
+# -----------------------------
+
+def build_aerender_cmd(
+    args: argparse.Namespace,
+    s: int,
+    e: int,
+    output_path: str, # This is the LOCAL path
+) -> List[str]:
+    
+    cmd: List[str] = [
+        args.aerender_path,
+        "-project", args.project,
+        "-output", output_path,
+        "-sound", "OFF",
+        "-s", str(s),
+        "-e", str(e),
+    ]
+
+    if args.comp:
+        cmd += ["-comp", args.comp]
+    if args.rqindex is not None:
+        cmd += ["-rqindex", str(args.rqindex)]
+    if getattr(args, "rs_template", None):
+        cmd += ["-RStemplate", args.rs_template]
+    if getattr(args, "om_template", None):
+        cmd += ["-OMtemplate", args.om_template]
+    
+    # MFR Logic
+    mfr_flag = "OFF" if args.disable_mfr else "ON"
+    cmd += ["-mfr", mfr_flag, "100"]
+
+    return cmd
+
+
+# -----------------------------
+# Main Orchestrator
+# -----------------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="STMPO After Effects Orchestrator")
@@ -387,19 +510,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end", type=int, required=True)
     
     p.add_argument("--concurrency", type=int, default=0)
-    p.add_argument("--max_concurrency", type=int, default=24)
+    p.add_argument("--max_concurrency", type=int, default=32)
     
     p.add_argument("--spawn_delay", type=float, default=2.0)
     p.add_argument("--child_grace_sec", type=float, default=10.0)
     
     p.add_argument("--kill_on_fail", action="store_true")
-    p.add_argument("--no_kill_on_fail", dest="kill_on_fail", 
-                   action="store_false")
+    p.add_argument("--no_kill_on_fail", dest="kill_on_fail", action="store_false")
+    p.set_defaults(kill_on_fail=True)
     
     p.add_argument("--env_file", default=None)
     p.add_argument("--log_file", default=None)
     
-    p.add_argument("--ram_per_process_gb", type=float, default=32.0)
+    p.add_argument("--ram_per_process_gb", type=float, default=10.0)
     p.add_argument("--mfr_threads", type=int, default=16, help="Target MFR threads per process")
     p.add_argument("--disable_mfr", action="store_true")
     
@@ -431,63 +554,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output_is_pattern", action="store_true")
     
     return p.parse_args()
-
-
-def offload_worker(
-    local_dir: Path,
-    final_dir: Path,
-    stop_event: threading.Event,
-    logger: logging.Logger,
-):
-    """
-    Move frames from local NVMe scratch to the final NAS destination.
-    Uses a small burst size to avoid overwhelming the NAS with large I/O spikes.
-    """
-    def process_files(burst_limit: int) -> int:
-        moved = 0
-        for local_file in sorted(local_dir.glob("*")):
-            if moved >= burst_limit:
-                break
-            dest = final_dir / local_file.name
-            try:
-                if dest.exists():
-                    logger.debug(f"[Offload] Destination already exists, skipping: {dest}")
-                    continue
-                # Use move (rename) when possible, fallback to copy if cross-device
-                try:
-                    shutil.move(str(local_file), str(dest))
-                    logger.debug(f"[Offload] Moved {local_file} -> {dest}")
-                except shutil.Error:
-                    shutil.copy2(str(local_file), str(dest))
-                    local_file.unlink(missing_ok=True)
-                    logger.debug(f"[Offload] Copied {local_file} -> {dest}")
-                moved += 1
-            except PermissionError:
-                # Transient lock on NAS – sleep briefly and retry in a subsequent scan
-                for attempt in range(3):
-                    logger.warning(
-                        f"[Offload] File lock when moving {local_file.name} (attempt {attempt + 1}/3); retrying..."
-                    )
-                    time.sleep(0.5)
-                    continue
-            except Exception as ex:
-                logger.warning(f"[Offload] Failed moving {local_file} -> {dest}: {ex}")
-        return moved
-
-    # Main offload loop
-    while not stop_event.is_set():
-        moved = process_files(OFFLOAD_BURST_LIMIT)
-        if moved == 0:
-            time.sleep(OFFLOAD_IDLE_INTERVAL)
-        else:
-            time.sleep(OFFLOAD_SCAN_INTERVAL)
-
-    # Final Cleanup Pass
-    logger.info("Offloader received stop signal. Performing final pass...")
-    for _ in range(3):
-        process_files(OFFLOAD_BURST_LIMIT)
-        if not any(local_dir.glob("*")):
-            break
 
 
 def main():
@@ -528,17 +594,33 @@ def main():
     total_frames = args.end - args.start + 1
     concurrency = min(requested, total_frames)
 
-    logger.info(
-        f"STMPO: frames={args.start}-{args.end}, requested_concurrency={requested}, "
-        f"effective_concurrency={concurrency}, total_frames={total_frames}"
-    )
+    logger.info(f"Orchestration: Concurrency={concurrency}, MFR={'OFF' if args.disable_mfr else 'ON'}")
+    logger.info(f"Pipeline: NVMe [{local_output_path}] -> NAS [{final_output_path}]")
 
-    # Load NUMA map & affinity blocks if enabled
-    affinities: Optional[List[List[int]]] = None
+    if args.disable_affinity and logical_cpus > 64:
+        logger.info(
+            "Affinity disabled by default on high-core host (logical_cpus=%s).",
+            logical_cpus,
+        )
+    elif args.disable_affinity:
+        logger.info(
+            "Affinity disabled by global default. Use --enable_affinity to explicitly opt back in."
+        )
+    else:
+        logger.info("Affinity explicitly enabled via --enable_affinity.")
+
+    # Load NUMA/Affinity
+    affinities: List[List[int]] = []
     if not args.disable_affinity:
         try:
-            numa_nodes = load_numa_map(args.numa_map)
-            if numa_nodes:
+            numa_path = args.numa_map
+            if not numa_path:
+                candidate = Path(__file__).with_name("numa_map.json")
+                if candidate.exists():
+                    numa_path = str(candidate)
+            
+            if numa_path and Path(numa_path).exists():
+                numa_nodes = load_numa_nodes(numa_path, logger)
                 pools = numa_nodes_to_pools(numa_nodes)
                 if pools:
                     logger.info(f"Parsed NUMA CPU pools: {pools}")
@@ -569,52 +651,60 @@ def main():
     child_env.update(env_overrides)
 
     # HYBRID: Enhanced Environment Logging
-    if env_overrides:
-        preview_items = list(env_overrides.items())
-        preview = ", ".join([f"{k}={v}" for k, v in preview_items[:5]])
-        if len(env_overrides) > 5:
-            preview += f", ... (+{len(env_overrides) - 5} more)"
-        logger.info(f"Environment overrides: {preview}")
+    if args.env_file:
+        logger.info(f"Environment overrides loaded from {args.env_file}: {len(env_overrides)} entries")
+        if env_overrides:
+            # Truncated preview from Version A
+            preview_items = list(env_overrides.items())
+            preview = ", ".join([f"{k}={v}" for k, v in preview_items[:5]])
+            if len(env_overrides) > 5:
+                preview += f", ... (+{len(env_overrides) - 5} more)"
+            logger.info(f"Environment override preview: {preview}")
+        else:
+            logger.info("Env file provided but contained no overrides.")
+    else:
+        logger.info("No env_file provided; using process environment only.")
 
-    children: List[WorkerProcess] = []
+    # HYBRID: Spawn Plan
+    logger.info(f"Spawn plan: {len(ranges)} children across frames {args.start}-{args.end} (per-child ~{math.ceil((args.end - args.start + 1)/len(ranges))} frames)")
+
+    children: List[ChildProc] = []
+    out_q: queue.Queue = queue.Queue()
     stop_children_event = threading.Event()
 
-    def make_cmd(start_f: int, end_f: int) -> List[str]:
-        cmd = [
-            args.aerender_path,
-            "-project", args.project,
-            "-rqindex", str(args.rqindex) if args.rqindex is not None else "1",
-            "-output", str(local_output_path),
-            "-s", str(start_f),
-            "-e", str(end_f),
-        ]
-        if args.comp:
-            cmd += ["-comp", args.comp]
-        if args.rs_template:
-            cmd += ["-RStemplate", args.rs_template]
-        if args.om_template:
-            cmd += ["-OMtemplate", args.om_template]
-        if args.output_is_pattern:
-            cmd += ["-output", str(local_output_path)]
-        if args.disable_mfr:
-            cmd += ["-mfr", "off"]
-        return cmd
+    # Cleanup Helper
+    def cleanup_resources():
+        logger.info("Shutting down...")
+        stop_children_event.set()
+        for ch in children:
+            if ch.popen.poll() is None:
+                try:
+                    ch.popen.terminate()
+                except:
+                    pass
+        stop_offload_event.set()
+        if offloader_thread.is_alive():
+            offloader_thread.join()
+        try:
+            if local_scratch_dir.exists():
+                shutil.rmtree(local_scratch_dir, ignore_errors=True)
+                logger.info("Scratch cleared.")
+        except Exception as e:
+            logger.warning(f"Error clearing scratch: {e}")
 
-    # Streaming reader for child stdout
-    out_q: queue.Queue = queue.Queue()
+    signal.signal(signal.SIGINT, lambda s, f: cleanup_resources())
+    signal.signal(signal.SIGTERM, lambda s, f: cleanup_resources())
 
-    def reader_thread(tag: str, pipe, pid: int):
-        for line in iter(pipe.readline, ""):
-            out_q.put((pid, tag, line.rstrip("\r\n")))
-        pipe.close()
+    last_log_time: Dict[int, float] = {}
+    last_log_line: Dict[int, str] = {}
 
-    # Launch workers
     for i, (s, e) in enumerate(ranges):
-        if stop_children_event.is_set():
-            break
+        if stop_children_event.is_set(): break
+        if i > 0 and args.spawn_delay > 0:
+            time.sleep(args.spawn_delay)
 
-        cmd = make_cmd(s, e)
-
+        cmd = build_aerender_cmd(args, s, e, str(local_output_path))
+        
         # HYBRID: Full Command Echo (Debug Mode)
         if DEBUG_MODE:
             logger.info(f"Launching #{i} for frames {s}-{e}")
@@ -645,54 +735,67 @@ def main():
                 logger.debug(f"Could not attach psutil handle to PID {p.pid}: {ph_ex}")
                 proc_handle = None
 
-            wp = WorkerProcess(
-                popen=p,
-                psutil_proc=proc_handle,
-                start_frame=s,
-                end_frame=e,
-                start_time=time.time()
-            )
-            children.append(wp)
+            threading.Thread(target=stream_reader, args=(p.pid, p.stdout, out_q, "LOG"), daemon=True).start()
 
-            t = threading.Thread(target=reader_thread, args=(f"worker-{i}", p.stdout, p.pid), daemon=True)
-            t.start()
-
-            if i < len(ranges) - 1:
-                time.sleep(max(0.0, args.spawn_delay))
+            children.append(ChildProc(p, (s, e), applied_affinity, proc_handle, time.time()))
+            last_log_time[p.pid] = time.time()
+            logger.info(f"Launched Worker #{i} (PID {p.pid}) Frames {s}-{e} affinity={applied_affinity}")
 
         except Exception as ex:
-            logger.error(f"Failed to launch worker {i} ({s}-{e}): {ex}", exc_info=True)
+            logger.error(f"Spawn failed: {ex}")
+            cleanup_resources()
+            sys.exit(1)
 
-    if not children:
-        logger.error("No workers were launched; aborting.")
-        stop_offload_event.set()
-        offloader_thread.join()
-        sys.exit(1)
-
-    # 5. Monitor Children (Heartbeats)
-    # --------------------------------
+    # 5. Monitor Loop
+    # ---------------
     last_heartbeat = time.time()
-    last_log_time: Dict[int, float] = {}
-    last_log_line: Dict[int, str] = {}
-    zero_cpu_counts: Dict[int, int] = {}
-    zero_cpu_global_streak = 0
-    last_zero_cpu_diag = 0.0
+    completion_logged: Set[int] = set()
+    stalled_pids: Set[int] = set()
     zero_cpu_hint_emitted = False
-
+    zero_cpu_counts: Dict[int, int] = {}
+    zero_cpu_terminated: Set[int] = set()
+    render_progress: Set[int] = set()
+    child_failures: Dict[int, str] = {}
+    last_zero_cpu_diag: float = 0.0
+    zero_cpu_global_streak = 0
     job_failed = False
     job_failed_logged = False
-
-    def handle_sigint(signum, frame):
-        logger.warning("SIGINT received; signalling children to stop...")
-        stop_children_event.set()
-
-    signal.signal(signal.SIGINT, handle_sigint)
-
-    idle_wait = HEARTBEAT_SECONDS / 3.0
-
+    
     while True:
-        # Drain log queue
+        # Drain Logs (block briefly to avoid busy-wait CPU burn)
+        time_to_heartbeat = max(0.0, HEARTBEAT_SECONDS - (time.time() - last_heartbeat))
         try:
+            pid, tag, line = out_q.get(timeout=min(0.5, time_to_heartbeat))
+            logger.info(f"[PID {pid}] {line}")
+            last_log_time[pid] = time.time()
+            last_log_line[pid] = line
+
+            lower_line = line.lower()
+            if pid not in render_progress:
+                if "progress:" in lower_line or "starting composition" in lower_line or "finished composition" in lower_line:
+                    render_progress.add(pid)
+            if pid not in child_failures:
+                if "error code: 14" in lower_line or "unexpected error occurred while exporting" in lower_line:
+                    child_failures[pid] = "After Effects Error Code 14 detected"
+                    logger.error(
+                        f"Detected After Effects Error Code 14 in PID {pid} output; terminating worker to force retry."
+                    )
+                    try:
+                        psutil.Process(pid).terminate()
+                    except Exception:
+                        pass
+
+                if "could not be found" in lower_line and ".tif" in lower_line:
+                    child_failures[pid] = "Rendered frame missing on disk"
+                    logger.error(
+                        f"PID {pid} reported a missing rendered frame; terminating worker so frames can be retried."
+                    )
+                    try:
+                        psutil.Process(pid).terminate()
+                    except Exception:
+                        pass
+
+            # Drain any remaining lines quickly without another blocking wait
             while True:
                 try:
                     pid, tag, line = out_q.get_nowait()
@@ -724,59 +827,69 @@ def main():
                 mem = None
                 status = "unknown"
 
-                if ch.psutil_proc is not None:
-                    try:
-                        cpu = ch.psutil_proc.cpu_percent(interval=0.0)
-                    except Exception:
-                        cpu = None
-                    try:
-                        mem = ch.psutil_proc.memory_info().rss / (1024.0 * 1024.0)
-                    except Exception:
-                        mem = None
+                current_affinity = ch.affinity or []
+
+                if ch.psutil_proc:
                     try:
                         status = ch.psutil_proc.status()
-                    except Exception:
-                        status = "unknown"
+                        # HYBRID: Use blocking 0.05s sample for accuracy (from Version B)
+                        cpu = ch.psutil_proc.cpu_percent(interval=0.05)
+                        mem_info = ch.psutil_proc.memory_info()
+                        mem = mem_info.rss / (1024 ** 2)
+                        try:
+                            current_affinity = ch.psutil_proc.cpu_affinity()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        status = "access_denied"
+                    except Exception as hb_ex:
+                        logger.debug(f"Heartbeat psutil read failed for PID {pid}: {hb_ex}")
 
-                if rc is None:
-                    # still running
-                    if cpu is not None and cpu <= 0.01:
-                        zero_cpu_counts[pid] = zero_cpu_counts.get(pid, 0) + 1
+                # Detect Low CPU (Version B logic)
+                if state == "running" and cpu is not None:
+                    if pid not in render_progress:
+                        running_cpu_zero.append(cpu <= 0.01)
+                        if cpu <= 0.01:
+                            zero_cpu_counts[pid] = zero_cpu_counts.get(pid, 0) + 1
+                        else:
+                            zero_cpu_counts[pid] = 0
                     else:
                         zero_cpu_counts[pid] = 0
-                else:
-                    # child exited - keep counts but note as zombie if long-dead
-                    if now - ch.start_time > LOG_SILENCE_TIMEOUT:
-                        zombie_pids.append(pid)
 
-                summaries.append(
-                    f"PID {pid}: state={state}, runtime={runtime:.1f}s, "
-                    f"cpu={fmt_metric(cpu,'','')}, mem={fmt_metric(mem,1,'MB')}, status={status}"
-                )
-
-                # Track "stalled" workers for potential global stuck detection
-                if rc is None and zero_cpu_counts.get(pid, 0) >= 2:
-                    running_cpu_zero.append(pid)
-
-                # Detect per-worker stalls (no log output for a long time)
-                last = last_log_time.get(pid, ch.start_time)
-                if now - last > LOG_SILENCE_TIMEOUT and rc is None:
+                # Detect no log output
+                last_log = last_log_time.get(pid, ch.start_time)
+                if state == "running" and now - last_log >= LOG_SILENCE_TIMEOUT:
                     stalled_children.append(pid)
 
-            if summaries:
-                logger.info("Worker states:\n  " + "\n  ".join(summaries))
+                # Detect Zombies (Version A logic)
+                if status == psutil.STATUS_ZOMBIE or status == "zombie":
+                    zombie_pids.append(pid)
 
-            if stalled_children:
-                logger.warning(
-                    "Stalled workers detected (no log output for a while): "
-                    + ", ".join(str(pid) for pid in stalled_children)
+                # Format Summary (Version A structure)
+                summaries.append(
+                    f"PID {pid} {state} frames {ch.frame_range[0]}-{ch.frame_range[1]} "
+                    f"elapsed={runtime:.1f}s status={status} cpu%={fmt_metric(cpu)} rss_mb={fmt_metric(mem)} "
+                    f"affinity={current_affinity if current_affinity else 'none'} rc={rc}"
                 )
 
-            # Global "all workers at zero CPU" diagnostic
-            pending_children = [c for c in children if c.popen.poll() is None]
-            if pending_children and len(running_cpu_zero) == len(pending_children):
+            # Print multiline status
+            logger.info("Heartbeat Details:\n  " + "\n  ".join(summaries))
+
+            # Diagnostic Warnings
+            if zombie_pids:
+                logger.warning(f"Heartbeat diagnostic: Zombie renderer processes detected: {zombie_pids}")
+
+            pending_children = [ch for ch in running_children if ch.popen.pid not in render_progress]
+
+            if pending_children and running_cpu_zero and all(running_cpu_zero):
                 zero_cpu_global_streak += 1
-                if now - last_zero_cpu_diag >= HEARTBEAT_SECONDS:
+                zero_cpu_streak = min([zero_cpu_counts.get(ch.popen.pid, 0) for ch in pending_children])
+                logger.warning(
+                    "Heartbeat diagnostic: All running aerender children are currently reporting ",
+                    "near-zero CPU (<= 0.01%). They may be in splash/licensing or between render phases. ",
+                    "Check After Effects UI or licensing state if this persists.",
+                )
+                if zero_cpu_streak >= 2 and now - last_zero_cpu_diag >= HEARTBEAT_SECONDS:
                     diag_lines = []
                     for ch in pending_children:
                         pid = ch.popen.pid
@@ -789,7 +902,7 @@ def main():
                     last_zero_cpu_diag = now
                 if not zero_cpu_hint_emitted:
                     logger.warning(
-                        "Hint: If this warning repeats for several minutes with no new log output, try "
+                        "Hint: If this warning repeats for several minutes with no new log output, try ",
                         "reducing --concurrency and/or disabling affinity to rule out pinning/licensing issues.",
                     )
                     zero_cpu_hint_emitted = True
@@ -808,32 +921,68 @@ def main():
                 ):
                     logger.error(
                         "Workers appear stuck in the After Effects splash/licensing screen "
-                        "with near-zero CPU usage. This usually indicates a licensing, "
-                        "plugin, or environment issue. Aborting job so it can be retried "
-                        "with adjusted settings (e.g., lower concurrency, different license)."
+                        "(zero CPU and never progressed past launch). Terminating stalled workers "
+                        "so the task can retry those frames."
                     )
-                    job_failed = True
-                    stop_children_event.set()
+                    for ch in pending_children:
+                        pid = ch.popen.pid
+                        try:
+                            psutil.Process(pid).terminate()
+                            child_failures[pid] = "Stuck at launch (zero CPU heartbeats)"
+                            logger.warning(
+                                f"Heartbeat diagnostic: PID {pid} reported <=0.01% CPU for "
+                                f"{ZERO_CPU_STUCK_HEARTBEATS} consecutive heartbeats and no render progress; "
+                                "terminating to break stall."
+                            )
+                        except Exception:
+                            pass
             else:
                 zero_cpu_global_streak = 0
 
-            # Detect zombie PIDs
-            if zombie_pids:
-                logger.warning(f"Zombie workers detected (long-dead): {zombie_pids}")
+            # IMPORTANT: Do NOT kill workers purely on low CPU. AE can legitimately sit at low CPU between
+            # heavy phases while still making progress. Stalls are handled via log-silence detection below.
+            for stalled_pid in stalled_children:
+                if stalled_pid in stalled_pids:
+                    continue
+                stalled_pids.add(stalled_pid)
+                logger.warning(
+                    f"Heartbeat diagnostic: PID {stalled_pid} produced no log output for {LOG_SILENCE_TIMEOUT}s; terminating to avoid long hangs. "
+                    "Consider relaunching with reduced concurrency if this persists."
+                )
+                try:
+                    psutil.Process(stalled_pid).terminate()
+                except Exception as stall_ex:
+                    logger.debug(f"Failed to terminate stalled PID {stalled_pid}: {stall_ex}")
+
             last_heartbeat = now
 
-        # Check exit conditions
-        all_done = all(c.popen.poll() is not None for c in children)
-        any_failed = any(c.popen.poll() not in (None, 0) for c in children)
+        # Check Status
+        all_done = True
+        any_failed = False
         fail_pid = None
         fail_rc = None
-        if any_failed:
-            for ch in children:
-                rc = ch.popen.poll()
-                if rc not in (None, 0):
-                    fail_pid = ch.popen.pid
-                    fail_rc = rc
-                    break
+        
+        for ch in children:
+            rc = ch.popen.poll()
+            failure_reason = child_failures.get(ch.popen.pid)
+            if rc is None:
+                all_done = False
+                continue
+
+            # Log completion once
+            if ch.popen.pid not in completion_logged:
+                duration = time.time() - ch.start_time
+                logger.info(f"Worker PID {ch.popen.pid} completed frames {ch.frame_range[0]}-{ch.frame_range[1]} with code {rc} after {duration:.1f}s")
+                completion_logged.add(ch.popen.pid)
+
+            if failure_reason:
+                any_failed = True
+                fail_pid = ch.popen.pid
+                fail_rc = failure_reason
+            elif rc != 0:
+                any_failed = True
+                fail_pid = ch.popen.pid
+                fail_rc = rc
 
         if any_failed:
             job_failed = True
@@ -841,7 +990,7 @@ def main():
                 logger.error(f"Worker PID {fail_pid} failed with RC {fail_rc}")
                 if args.kill_on_fail:
                     logger.error(
-                        "kill_on_fail enabled; allowing running renderers to finish but job will exit non-zero once they complete."
+                        "kill_on_fail enabled; allowing running renders to finish but job will exit non-zero once they complete."
                     )
                 else:
                     logger.error("Continuing to monitor remaining workers; job will report failure when monitoring completes.")
@@ -849,15 +998,22 @@ def main():
 
         if all_done:
             if job_failed:
-                logger.error("One or more workers failed; exiting with failure status after allowing other workers to complete.")
-                stop_offload_event.set()
-                offloader_thread.join()
+                logger.error("One or more workers failed; exiting with failure status after allowing other renders to finish.")
+                cleanup_resources()
                 sys.exit(1)
-            else:
-                logger.info("All workers completed successfully.")
-                break
-
-        time.sleep(idle_wait)
+            logger.info("All render processes completed successfully.")
+            break
+        
+        if stop_children_event.is_set():
+            cleanup_resources()
+            sys.exit(1)
+        
+        # HYBRID: Faster tick (from Version B) without busy-waiting when quiet
+        # Block on the stop event instead of spinning so idle loops keep CPU near zero.
+        # When the log queue is busy, wake quickly; when quiet, wait longer but still
+        # bounded by the heartbeat interval so diagnostics fire on time.
+        idle_wait = 0.05 if not out_q.empty() else min(2.0, max(0.2, time_to_heartbeat))
+        stop_children_event.wait(idle_wait)
 
     # 6. Final Sync
     # -------------
