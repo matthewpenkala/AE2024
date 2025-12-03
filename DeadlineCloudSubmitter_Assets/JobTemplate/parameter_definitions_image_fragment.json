@@ -98,7 +98,7 @@
     {
       "name": "MaxConcurrency",
       "type": "INT",
-      "default": 48,
+      "default": 24,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "STMPO Max Concurrency",
@@ -108,7 +108,7 @@
     {
       "name": "RamPerProcessGB",
       "type": "FLOAT",
-      "default": 110.0,
+      "default": 32.0,
       "userInterface": {
         "control": "SPIN_BOX",
         "label": "RAM per aerender (GB)",
@@ -132,14 +132,14 @@
     {
       "name": "DisableAffinity",
       "type": "STRING",
-      "default": "true",
+      "default": "false",
       "allowedValues": [
         "true",
         "false"
       ],
       "userInterface": {
         "control": "CHECK_BOX",
-        "label": "Disable CPU affinity",
+        "label": "Disable CPU affinity / NUMA pinning",
         "groupLabel": "STMPO Advanced"
       }
     },

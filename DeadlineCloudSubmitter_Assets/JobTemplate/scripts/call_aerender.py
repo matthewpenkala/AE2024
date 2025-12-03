@@ -130,12 +130,12 @@ def parse_args():
 
     # NEW STMPO args (values are passed as strings from OpenJD)
     p.add_argument("--concurrency", default="-1")
-    p.add_argument("--max_concurrency", default="48")
-    p.add_argument("--ram_per_process_gb", default="110.0")
-    p.add_argument("--mfr_threads", default="2")
+    p.add_argument("--max_concurrency", default="24")
+    p.add_argument("--ram_per_process_gb", default="32.0")
+    p.add_argument("--mfr_threads", default="16")
     p.add_argument("--disable_mfr", default="false")
     p.add_argument("--numa_map", default="")
-    p.add_argument("--disable_affinity", default="true")
+    p.add_argument("--disable_affinity", default="false")
     p.add_argument("--spawn_delay", default="2.0")
     p.add_argument("--child_grace_sec", default="10")
     p.add_argument("--no_kill_on_fail", default="false")
@@ -167,15 +167,11 @@ def main():
     )
 
     logical_cpus = os.cpu_count() or 0
-    auto_disable_affinity = logical_cpus > 64
+    auto_disable_affinity = False
     user_disable_affinity = str_to_bool(args.disable_affinity)
-    if auto_disable_affinity:
-        _logger.info(
-            f"[call_aerender] Auto-disabling affinity (logical_cpus={logical_cpus} > 64)."
-        )
 
     disable_affinity = user_disable_affinity or auto_disable_affinity
-    enable_affinity = not disable_affinity and not auto_disable_affinity
+    enable_affinity = not disable_affinity
 
     # Build STMPO command
     # Resolve NUMA map path: prefer explicit, else job-attached map.

@@ -232,23 +232,79 @@ def build_affinity_blocks(concurrency: int, pools: List[List[int]]) -> List[List
 
 def auto_concurrency(args: argparse.Namespace, logger: logging.Logger) -> int:
     """
-    Heuristic for Concurrency.
-    Refined for High-Core Count Machines (EPYC/Threadripper).
+    Heuristic for Concurrency tuned for high-core, high-RAM hosts (e.g. dual EPYC + 1 TB).
+    Balances CPU threads, RAM per process, and MaxConcurrency.
     """
     logical = psutil.cpu_count(logical=True) or 8
-    
-    if args.disable_mfr:
-        # Classical AE: One core per instance roughly.
-        base = max(1, logical // 4)
+
+    # Try to read total RAM; fall back to 0 if psutil is not available/allowed.
+    try:
+        vm = psutil.virtual_memory()
+        total_ram_gb = vm.total / float(1024 ** 3)
+    except Exception:
+        total_ram_gb = 0.0
+
+    # Ensure we have a sane per-process RAM budget
+    try:
+        ram_per_proc_gb = float(getattr(args, "ram_per_process_gb", 0.0) or 0.0)
+    except Exception:
+        ram_per_proc_gb = 0.0
+    if ram_per_proc_gb <= 0.0:
+        ram_per_proc_gb = 32.0  # sensible default for large hosts
+
+    # Use only a fraction of total RAM for children so we leave room for AE / OS / other tasks.
+    if total_ram_gb > 0.0:
+        usable_ram_gb = max(1.0, total_ram_gb * 0.8)
+        max_by_ram = max(1, int(usable_ram_gb // ram_per_proc_gb))
     else:
-        # MFR Enabled:
-        target_threads_per_proc = max(16, args.mfr_threads)
-        base = max(1, logical // target_threads_per_proc)
+        # If we can't detect RAM, don't let RAM limit us.
+        usable_ram_gb = 0.0
+        max_by_ram = logical
 
-    if args.max_concurrency > 0:
-        base = min(base, args.max_concurrency)
+    # Thread-based limit
+    mfr_threads = getattr(args, "mfr_threads", 0) or 0
+    try:
+        mfr_threads = int(mfr_threads)
+    except Exception:
+        mfr_threads = 0
 
-    logger.info(f"Auto concurrency chose {base} (logical={logical}, target_threads={target_threads_per_proc if not args.disable_mfr else 'N/A'})")
+    if args.disable_mfr:
+        # Classic AE style: more, lighter-weight processes.
+        target_threads_per_proc = max(8, mfr_threads or 8)
+    else:
+        # MFR enabled: fewer, heavier processes.
+        target_threads_per_proc = max(16, mfr_threads or 16)
+
+    base_by_threads = max(1, logical // target_threads_per_proc)
+
+    # Combine limits
+    base = min(max_by_ram, base_by_threads)
+
+    # Respect MaxConcurrency if provided
+    max_conc = getattr(args, "max_concurrency", 0) or 0
+    try:
+        max_conc = int(max_conc)
+    except Exception:
+        max_conc = 0
+    if max_conc > 0:
+        base = min(base, max_conc)
+
+    if base < 1:
+        base = 1
+
+    logger.info(
+        "Auto concurrency chose %s (logical=%s, total_ram_gb=%.1f, usable_ram_gb=%.1f, "
+        "ram_per_proc_gb=%.1f, max_by_ram=%s, base_by_threads=%s, disable_mfr=%s, mfr_threads=%s)",
+        base,
+        logical,
+        total_ram_gb,
+        usable_ram_gb,
+        ram_per_proc_gb,
+        max_by_ram,
+        base_by_threads,
+        args.disable_mfr,
+        target_threads_per_proc,
+    )
     return base
 
 
@@ -510,7 +566,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--end", type=int, required=True)
     
     p.add_argument("--concurrency", type=int, default=0)
-    p.add_argument("--max_concurrency", type=int, default=32)
+    p.add_argument("--max_concurrency", type=int, default=24)
     
     p.add_argument("--spawn_delay", type=float, default=2.0)
     p.add_argument("--child_grace_sec", type=float, default=10.0)
@@ -522,7 +578,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--env_file", default=None)
     p.add_argument("--log_file", default=None)
     
-    p.add_argument("--ram_per_process_gb", type=float, default=10.0)
+    p.add_argument("--ram_per_process_gb", type=float, default=32.0)
     p.add_argument("--mfr_threads", type=int, default=16, help="Target MFR threads per process")
     p.add_argument("--disable_mfr", action="store_true")
     
@@ -531,10 +587,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--disable_affinity",
         action="store_true",
-        default=True,
+        default=False,
         help=(
-            "Disable CPU affinity (default)."
-            " Affinity can be explicitly re-enabled with --enable_affinity."
+            "Disable CPU affinity / NUMA pinning. Default is False so affinity is enabled."
+            " On Windows hosts with more than 64 logical CPUs, affinity may still be"
+            " constrained by processor groups."
         ),
     )
     p.add_argument(
