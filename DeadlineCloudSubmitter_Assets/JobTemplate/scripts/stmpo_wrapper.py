@@ -237,7 +237,7 @@ def auto_concurrency(args: argparse.Namespace, logger: logging.Logger) -> int:
     """
     logical = psutil.cpu_count(logical=True) or 8
 
-    # Try to read total RAM; fall back to 0 if psutil is not available/allowed.
+    # Try to read total RAM; fall back if psutil is not available.
     try:
         vm = psutil.virtual_memory()
         total_ram_gb = vm.total / float(1024 ** 3)
@@ -257,7 +257,6 @@ def auto_concurrency(args: argparse.Namespace, logger: logging.Logger) -> int:
         usable_ram_gb = max(1.0, total_ram_gb * 0.8)
         max_by_ram = max(1, int(usable_ram_gb // ram_per_proc_gb))
     else:
-        # If we can't detect RAM, don't let RAM limit us.
         usable_ram_gb = 0.0
         max_by_ram = logical
 
