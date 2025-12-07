@@ -62,9 +62,19 @@ Together, they let a single Deadline task fan out into **multiple parallel `aere
     - Spawn timing and fail-fast behaviour.
   - Job environment that **creates output directories** on the worker before rendering.
 
-- 🔤 **Font deployment**
-  - Detects fonts used on the submitter machine, attaches them to the job, and installs them on the worker at job start.
-  - Cleans up fonts at job end, so workers stay tidy.
+  - 🔤 **Font deployment**
+    - Detects fonts used on the submitter machine, attaches them to the job, and installs them on the worker at job start.
+    - Cleans up fonts at job end, so workers stay tidy.
+
+---
+
+## Dependencies
+
+The worker-side Python scripts expect **Python 3.9+** with [`psutil`](https://pypi.org/project/psutil/) installed. Install it on render hosts before running jobs:
+
+```bash
+python -m pip install psutil
+```
 
 ---
 
