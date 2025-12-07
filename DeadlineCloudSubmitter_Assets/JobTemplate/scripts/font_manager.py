@@ -11,6 +11,7 @@ import shutil
 import sys
 import traceback
 from ctypes import wintypes
+from typing import Set, Tuple
 
 try:
     import winreg
@@ -40,7 +41,7 @@ FONT_EXTENSIONS = [".otf", ".ttf", ".fon", ""]
 
 logger = logging.getLogger(__name__)
 
-def find_fonts(session_dir):
+def find_fonts(session_dir: str) -> Set[str]:
     """
     Looks for all font files that were sent along with the job
 
@@ -48,7 +49,7 @@ def find_fonts(session_dir):
 
     :returns: a set with all found fonts
     """
-    fonts = set()
+    fonts: Set[str] = set()
     for subfolder in os.listdir(session_dir):
         # Only look in assetroot folders
         if not subfolder.startswith("assetroot-"):
@@ -78,7 +79,7 @@ def find_fonts(session_dir):
     return fonts
 
 
-def get_font_name(dst_path):
+def get_font_name(dst_path: str) -> str:
     """
     Get a font's Windows system name, which is the name stored in the registry.
 
@@ -110,7 +111,7 @@ def get_font_name(dst_path):
     return fontname
 
 
-def install_font(src_path, scope=INSTALL_SCOPE_USER):
+def install_font(src_path: str, scope: str = INSTALL_SCOPE_USER) -> Tuple[bool, str]:
     """
     Install provided font to the worker machine
 
@@ -139,7 +140,7 @@ def install_font(src_path, scope=INSTALL_SCOPE_USER):
         # Load the font in the current session, remove font when loading fails
         if not gdi32.AddFontResourceW(dst_path):
             os.remove(dst_path)
-            raise WindowsError(f'AddFontResource failed to load "{src_path}"')
+            raise OSError(f'AddFontResource failed to load "{src_path}"')
 
         # Notify running programs
         user32.SendMessageTimeoutW(
@@ -158,7 +159,7 @@ def install_font(src_path, scope=INSTALL_SCOPE_USER):
     return True, ""
 
 
-def uninstall_font(src_path, scope=INSTALL_SCOPE_USER):
+def uninstall_font(src_path: str, scope: str = INSTALL_SCOPE_USER) -> Tuple[bool, str]:
     """
     Uninstall provided font from the worker machine
 
@@ -184,7 +185,7 @@ def uninstall_font(src_path, scope=INSTALL_SCOPE_USER):
         # Unload the font in the current session
         if not gdi32.RemoveFontResourceW(dst_path):
             os.remove(dst_path)
-            raise WindowsError(f'RemoveFontResourceW failed to load "{src_path}"')
+            raise OSError(f'RemoveFontResourceW failed to load "{src_path}"')
 
         if os.path.exists(dst_path):
             os.remove(dst_path)
@@ -198,7 +199,7 @@ def uninstall_font(src_path, scope=INSTALL_SCOPE_USER):
     return True, ""
 
 
-def _install_fonts(session_dir):
+def _install_fonts(session_dir: str) -> None:
     """
     Calls all needed functions for installing fonts
 
@@ -217,7 +218,7 @@ def _install_fonts(session_dir):
             raise RuntimeError(f"Error installing font: {msg}")
 
 
-def _remove_fonts(session_dir):
+def _remove_fonts(session_dir: str) -> None:
     """
     Calls all needed functions for removing fonts
 
@@ -238,7 +239,7 @@ def _remove_fonts(session_dir):
             logger.error(f"Error uninstalling font: {msg}")
 
 
-def setup_logger():
+def setup_logger() -> None:
     """
     Does a basic setup for a logger
     """
