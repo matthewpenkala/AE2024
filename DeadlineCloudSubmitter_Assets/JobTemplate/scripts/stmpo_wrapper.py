@@ -991,9 +991,9 @@ def main():
                 zero_cpu_global_streak += 1
                 zero_cpu_streak = min([zero_cpu_counts.get(ch.popen.pid, 0) for ch in pending_children])
                 logger.warning(
-                    "Heartbeat diagnostic: All running aerender children are currently reporting ",
-                    "near-zero CPU (<= 0.01%). They may be in splash/licensing or between render phases. ",
-                    "Check After Effects UI or licensing state if this persists.",
+                    "Heartbeat diagnostic: All running aerender children are currently reporting "
+                    "near-zero CPU (<= 0.01%). They may be in splash/licensing or between render phases. "
+                    "Check After Effects UI or licensing state if this persists."
                 )
                 if zero_cpu_streak >= 2 and now - last_zero_cpu_diag >= HEARTBEAT_SECONDS:
                     diag_lines = []
@@ -1008,8 +1008,8 @@ def main():
                     last_zero_cpu_diag = now
                 if not zero_cpu_hint_emitted:
                     logger.warning(
-                        "Hint: If this warning repeats for several minutes with no new log output, try ",
-                        "reducing --concurrency and/or disabling affinity to rule out pinning/licensing issues.",
+                        "Hint: If this warning repeats for several minutes with no new log output, try "
+                        "reducing --concurrency and/or disabling affinity to rule out pinning/licensing issues."
                     )
                     zero_cpu_hint_emitted = True
 
