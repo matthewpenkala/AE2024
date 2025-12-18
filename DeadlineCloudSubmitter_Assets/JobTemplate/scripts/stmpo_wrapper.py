@@ -185,6 +185,53 @@ def load_numa_nodes(json_path: str, logger: Optional[logging.Logger] = None) -> 
     return out
 
 
+def resolve_aerender_path(raw_path: Optional[str], logger: logging.Logger) -> str:
+    """Resolve the aerender.exe path with sensible fallbacks.
+
+    A blank string coming from the template is treated as "not provided". We then
+    try, in order:
+    - User-provided CLI flag
+    - Environment variable ``AERENDER_PATH``
+    - ``shutil.which("aerender")`` (lets PATH supply the location)
+    - The built-in ``DEFAULT_AERENDER`` constant
+
+    If none of the candidates exists on disk, the process exits with an explicit
+    error telling the user how to fix the configuration.
+    """
+
+    candidates: List[str] = []
+
+    if raw_path and str(raw_path).strip():
+        candidates.append(str(raw_path).strip())
+
+    env_path = os.environ.get("AERENDER_PATH")
+    if env_path:
+        candidates.append(env_path)
+
+    which_path = shutil.which("aerender")
+    if which_path:
+        candidates.append(which_path)
+
+    candidates.append(DEFAULT_AERENDER)
+
+    seen: Set[str] = set()
+    for cand in candidates:
+        # Avoid duplicate filesystem checks
+        if cand in seen:
+            continue
+        seen.add(cand)
+
+        expanded = os.path.expandvars(cand)
+        if Path(expanded).exists():
+            logger.info(f"Using aerender executable: {expanded}")
+            return str(expanded)
+
+    logger.critical(
+        "Could not locate aerender.exe. Provide --aerender_path, set AERENDER_PATH, or add aerender to PATH."
+    )
+    sys.exit(1)
+
+
 def numa_nodes_to_pools(numa_nodes: Dict[str, List[int]]) -> List[List[int]]:
     pools: List[List[int]] = []
     def key_fn(item):
@@ -615,6 +662,9 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
     logger = setup_logging(args.log_file)
+
+    # Normalize aerender path so blank inputs gracefully fall back to env/PATH/defaults.
+    args.aerender_path = resolve_aerender_path(args.aerender_path, logger)
 
     logical_cpus = psutil.cpu_count(logical=True) or 0
 
