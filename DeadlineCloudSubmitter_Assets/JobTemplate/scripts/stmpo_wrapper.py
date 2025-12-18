@@ -1014,27 +1014,40 @@ def main():
                     zero_cpu_hint_emitted = True
 
                 # Hard-stop the job if every worker has been stuck at zero CPU for an
-                # extended period while still only logging "Launching After Effects".
+                # extended period without any render progress. This now triggers even when
+                # the last log line is not the explicit "Launching After Effects" marker, so
+                # we also catch licensing/splash stalls that log only the aerender version
+                # banner before hanging.
                 launching_only = all(
                     "launching after effects" in last_log_line.get(ch.popen.pid, "").lower()
                     for ch in pending_children
                 )
-                if (
-                    launching_only
-                    and zero_cpu_global_streak >= ZERO_CPU_STUCK_HEARTBEATS
-                    and now - min(ch.start_time for ch in pending_children)
+                prolonged_zero_cpu = zero_cpu_global_streak >= ZERO_CPU_STUCK_HEARTBEATS
+                long_runtime = (
+                    now - min(ch.start_time for ch in pending_children)
                     >= ZERO_CPU_STUCK_HEARTBEATS * HEARTBEAT_SECONDS
-                ):
+                )
+                no_progress = pending_children and all(
+                    zero_cpu_counts.get(ch.popen.pid, 0) >= ZERO_CPU_STUCK_HEARTBEATS
+                    and ch.popen.pid not in render_progress
+                    for ch in pending_children
+                )
+
+                if prolonged_zero_cpu and long_runtime and (launching_only or no_progress):
+                    reason = (
+                        "Stuck at launch (zero CPU heartbeats)"
+                        if launching_only
+                        else "Zero CPU with no render progress"
+                    )
                     logger.error(
-                        "Workers appear stuck in the After Effects splash/licensing screen "
-                        "(zero CPU and never progressed past launch). Terminating stalled workers "
-                        "so the task can retry those frames."
+                        "Workers appear stalled with persistent zero CPU and no render progress. "
+                        "Terminating stalled workers so the task can retry those frames."
                     )
                     for ch in pending_children:
                         pid = ch.popen.pid
                         try:
                             psutil.Process(pid).terminate()
-                            child_failures[pid] = "Stuck at launch (zero CPU heartbeats)"
+                            child_failures[pid] = reason
                             logger.warning(
                                 f"Heartbeat diagnostic: PID {pid} reported <=0.01% CPU for "
                                 f"{ZERO_CPU_STUCK_HEARTBEATS} consecutive heartbeats and no render progress; "
