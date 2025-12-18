@@ -76,6 +76,17 @@ The worker-side Python scripts expect **Python 3.9+** with [`psutil`](https://py
 python -m pip install psutil
 ```
 
+### Where does `aerender.exe` come from?
+
+`stmpo_wrapper.py` will locate the After Effects renderer in this order:
+
+1. The `--aerender_path` argument passed in by the template/submitter
+2. The `AERENDER_PATH` environment variable
+3. Whatever `aerender` path is discoverable on `PATH`
+4. The baked-in default (`E:\\DCC\\Adobe\\Adobe After Effects 2024\\Support Files\\aerender.exe`)
+
+You **do not have to modify `PATH`** if you set `AERENDER_PATH` or pass an explicit `--aerender_path`. If your install uses a non-standard location, set `AERENDER_PATH` system-wide on workers or adjust the template’s `AerenderPath` parameter so the orchestrator resolves it correctly.
+
 ---
 
 ## Performance profiles (recommended usage)
