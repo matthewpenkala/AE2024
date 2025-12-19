@@ -756,6 +756,12 @@ def main():
     child_env = os.environ.copy()
     child_env.update(env_overrides)
 
+    # Ensure render-only mode so aerender does not hang on UI/licensing prompts
+    # when running headless on Deadline workers.
+    if not child_env.get("AE_RENDER_ONLY_NODE"):
+        child_env["AE_RENDER_ONLY_NODE"] = "1"
+        logger.info("Setting AE_RENDER_ONLY_NODE=1 for headless render mode")
+
     # HYBRID: Enhanced Environment Logging
     if args.env_file:
         logger.info(f"Environment overrides loaded from {args.env_file}: {len(env_overrides)} entries")
@@ -1016,7 +1022,10 @@ def main():
                 # Hard-stop the job if every worker has been stuck at zero CPU for an
                 # extended period while still only logging "Launching After Effects".
                 launching_only = all(
-                    "launching after effects" in last_log_line.get(ch.popen.pid, "").lower()
+                    (
+                        "launching after effects" in last_log_line.get(ch.popen.pid, "").lower()
+                        or "aerender version" in last_log_line.get(ch.popen.pid, "").lower()
+                    )
                     for ch in pending_children
                 )
                 if (
