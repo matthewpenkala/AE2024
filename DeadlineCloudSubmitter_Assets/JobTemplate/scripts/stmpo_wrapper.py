@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -85,6 +86,15 @@ def fmt_metric(value: Optional[float], precision: int = 2, suffix: str = "") -> 
         return "n/a"
     return f"{value:.{precision}f}{suffix}"
 
+
+
+def looks_like_sequence(path_str: str) -> bool:
+    """Heuristic: returns True if the output path looks like an image-sequence pattern."""
+    return (
+        re.search(r"\[[#0]+\]", path_str) is not None  # AE: [#####] or [00000] style
+        or re.search(r"#{3,}", path_str) is not None     # #### style
+        or re.search(r"%0?\d*d", path_str) is not None  # printf style, e.g. %04d
+    )
 
 def summarize_descendants(proc: Optional[psutil.Process]) -> str:
     """Return a short summary of a worker's child processes for diagnostics."""
@@ -698,6 +708,16 @@ def main():
     # -------------------------------
     requested = args.concurrency if args.concurrency >= 1 else auto_concurrency(args, logger)
     total_frames = args.end - args.start + 1
+
+    # ✅ Guard: single-output files (mov/mp4/wav/etc) cannot be safely split across multiple aerender instances.
+    # This prevents concurrent writes/encoder locks that can look like a 'hang' (no PROGRESS lines).
+    if total_frames > 1 and not looks_like_sequence(str(final_output_path)):
+        if requested != 1:
+            logger.warning(
+                "Single-file output detected (%s). Forcing concurrency=1 to avoid concurrent writes/hangs.",
+                final_output_path,
+            )
+        requested = 1
     concurrency = min(requested, total_frames)
 
     logger.info(f"Orchestration: Concurrency={concurrency}, MFR={'OFF' if args.disable_mfr else 'ON'}")
@@ -755,6 +775,13 @@ def main():
     env_overrides = load_env_overrides(args.env_file)
     child_env = os.environ.copy()
     child_env.update(env_overrides)
+
+
+    # Ensure render-only mode so aerender does not hang on UI/licensing prompts
+    # when running headless on Deadline workers.
+    if not child_env.get("AE_RENDER_ONLY_NODE"):
+        child_env["AE_RENDER_ONLY_NODE"] = "1"
+        logger.info("Setting AE_RENDER_ONLY_NODE=1 for headless render mode")
 
     # HYBRID: Enhanced Environment Logging
     if args.env_file:
@@ -1016,7 +1043,10 @@ def main():
                 # Hard-stop the job if every worker has been stuck at zero CPU for an
                 # extended period while still only logging "Launching After Effects".
                 launching_only = all(
-                    "launching after effects" in last_log_line.get(ch.popen.pid, "").lower()
+                    (
+                        "launching after effects" in last_log_line.get(ch.popen.pid, "").lower()
+                        or "aerender version" in last_log_line.get(ch.popen.pid, "").lower()
+                    )
                     for ch in pending_children
                 )
                 if (
