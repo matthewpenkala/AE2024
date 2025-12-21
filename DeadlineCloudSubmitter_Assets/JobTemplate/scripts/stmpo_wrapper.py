@@ -96,6 +96,100 @@ def looks_like_sequence(path_str: str) -> bool:
         or re.search(r"%0?\d*d", path_str) is not None  # printf style, e.g. %04d
     )
 
+
+def build_output_matcher(output_spec: str):
+    """Builds a predicate Path->bool that returns True only for files that are render outputs.
+
+    Supports:
+      - AE patterns like [#####] / [00000]
+      - hash patterns like ####
+      - printf patterns like %04d
+      - single-file outputs (exact filename match)
+    """
+    base = os.path.basename(str(output_spec))
+    if not base:
+        return lambda p: False
+
+    # AE pattern: prefix[#####]suffix
+    m = re.search(r"(.*)\[([#0]+)\](.*)", base)
+    if m:
+        prefix, token, suffix = m.group(1), m.group(2), m.group(3)
+        digits = len(token)
+        rx = re.compile(rf"^{re.escape(prefix)}\d{{{digits}}}{re.escape(suffix)}$", re.IGNORECASE)
+        return lambda p: bool(rx.match(p.name))
+
+    # Hash pattern: prefix####suffix
+    m = re.search(r"(.*?)(#{3,})(\.[^.]*)?$", base)
+    if m:
+        prefix, token, suffix = m.group(1), m.group(2), m.group(3) or ""
+        digits = len(token)
+        rx = re.compile(rf"^{re.escape(prefix)}\d{{{digits}}}{re.escape(suffix)}$", re.IGNORECASE)
+        return lambda p: bool(rx.match(p.name))
+
+    # printf: prefix%04dsuffix
+    m = re.search(r"(.*)%0?(\d*)d(.*)", base)
+    if m:
+        prefix, digits_s, suffix = m.group(1), m.group(2), m.group(3)
+        digits = int(digits_s) if digits_s else 1
+        rx = re.compile(rf"^{re.escape(prefix)}\d{{{digits}}}{re.escape(suffix)}$", re.IGNORECASE)
+        return lambda p: bool(rx.match(p.name))
+
+    # Single file
+    return lambda p: p.name.lower() == base.lower()
+
+def stage_project_to_local(project_path: str, local_scratch_dir: str, logger) -> str:
+    """Stage the .aep/.aepx project file to local disk if it lives on a UNC path.
+
+    Why: After Effects/aerender can hang when opening projects over SMB (UNC/mapped shares),
+    especially when running under a service account/session. Staging the project file locally
+    avoids that initial network I/O stall.
+
+    NOTE: This copies ONLY the project file. If your project uses RELATIVE asset paths next to
+    the .aep, copying the .aep alone can make assets appear missing. In that scenario, either:
+      - use absolute paths to the NAS, or
+      - stage the whole project directory (not implemented here).
+    """
+    try:
+        if not project_path:
+            return project_path
+
+        # UNC path (\\server\share\...)
+        is_unc = project_path.startswith("\\\\") or project_path.startswith("//")
+        if not is_unc:
+            return project_path
+
+        os.makedirs(local_scratch_dir, exist_ok=True)
+        base = os.path.basename(project_path.rstrip("\\/"))
+        if not base:
+            return project_path
+
+        staging_dir = os.path.join(str(local_scratch_dir), "_project")
+        os.makedirs(staging_dir, exist_ok=True)
+        dest = os.path.join(staging_dir, base)
+
+        # If already staged, keep it
+        if os.path.abspath(dest).lower() == os.path.abspath(project_path).lower():
+            return project_path
+
+        # Copy with small retries (SMB hiccups are common)
+        for attempt in range(1, 4):
+            try:
+                shutil.copy2(project_path, dest)
+                if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                    logger.info(f"Staged project locally: {project_path} -> {dest}")
+                    return dest
+            except Exception as ex:
+                logger.warning(f"Project staging attempt {attempt}/3 failed: {ex}")
+                time.sleep(1.0 * attempt)
+
+        logger.warning("Project staging failed; proceeding with original project path.")
+        return project_path
+
+    except Exception as ex:
+        logger.warning(f"Project staging skipped due to error: {ex}")
+        return project_path
+
+
 def summarize_descendants(proc: Optional[psutil.Process]) -> str:
     """Return a short summary of a worker's child processes for diagnostics."""
     if not proc:
@@ -127,6 +221,55 @@ def summarize_descendants(proc: Optional[psutil.Process]) -> str:
             parts.append(f"{child.pid}: {ex}")
 
     return "; ".join(parts) if parts else "descendants present but not readable"
+
+
+def get_windows_session_id(pid: int) -> Optional[int]:
+    """Best-effort session id lookup (useful to detect service session 0)."""
+    try:
+        out = subprocess.check_output(
+            ['powershell','-NoProfile','-Command', f"(Get-Process -Id {pid}).SessionId"],
+            text=True,
+            errors='replace',
+        ).strip()
+        return int(out) if out else None
+    except Exception:
+        return None
+
+def tasklist_verbose_line(pid: int) -> str:
+    """Return a compact tasklist /v line for PID (or 'n/a').
+
+    NOTE: We intentionally avoid invoking cmd.exe with nested quoting here because
+    quote-stripping can cause TASKLIST to mis-parse the filter and emit:
+        Invalid argument/option - 'eq'
+    """
+    try:
+        out = subprocess.check_output(
+            ['tasklist', '/v', '/fi', f'PID eq {pid}'],
+            text=True,
+            errors='replace',
+            stderr=subprocess.STDOUT,
+        )
+        tl = [ln.rstrip() for ln in out.splitlines() if ln.strip()]
+        # Header is usually 2 lines; last meaningful line is the row.
+        if len(tl) >= 3:
+            return tl[-1].strip()
+        return " | ".join(tl[-1:]) if tl else 'n/a'
+    except Exception:
+        return 'n/a'
+
+def find_descendant_pid(proc: Optional[psutil.Process], name_equals: str) -> Optional[int]:
+    try:
+        if not proc:
+            return None
+        for ch in proc.children(recursive=True):
+            try:
+                if ch.name().lower() == name_equals.lower():
+                    return ch.pid
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
 
 def split_ranges(start: int, end: int, parts: int) -> List[Tuple[int, int]]:
     total = end - start + 1
@@ -495,7 +638,8 @@ def is_file_stable(filepath: Path) -> bool:
     except Exception:
         return False
 
-def offload_worker(local_dir: Path, remote_dir: Path, stop_event: threading.Event, logger: logging.Logger):
+def offload_worker(local_dir: Path, remote_dir: Path, stop_event: threading.Event, logger: logging.Logger,
+                  allow_pred=None, protected_paths: Optional[List[Path]] = None):
     """
     Watches local_dir for files. Moves them to remote_dir if they are stable.
 
@@ -514,9 +658,34 @@ def offload_worker(local_dir: Path, remote_dir: Path, stop_event: threading.Even
     except Exception as e:
         logger.error(f"Offloader could not create remote dir {remote_dir}: {e}")
 
+
+    protected_set: Set[str] = set()
+    if protected_paths:
+        for pp in protected_paths:
+            try:
+                protected_set.add(str(Path(pp).resolve()).lower())
+            except Exception:
+                protected_set.add(str(pp).lower())
+
+    def _should_offload(p: Path) -> bool:
+        try:
+            if str(p.resolve()).lower() in protected_set:
+                return False
+        except Exception:
+            if str(p).lower() in protected_set:
+                return False
+        if allow_pred is not None:
+            try:
+                return bool(allow_pred(p))
+            except Exception:
+                return False
+        return True
+
     def process_files(max_files: int) -> int:
         moved = 0
         for local_file in local_dir.glob("*"):
+            if not _should_offload(local_file):
+                continue
             if moved >= max_files:
                 break
 
@@ -561,11 +730,11 @@ def offload_worker(local_dir: Path, remote_dir: Path, stop_event: threading.Even
     logger.info("Offloader received stop signal. Performing final pass...")
     for _ in range(3):
         process_files(OFFLOAD_BURST_LIMIT)
-        if not any(local_dir.glob("*")):
+        if not any(p for p in local_dir.glob("*") if _should_offload(p)):
             break
         time.sleep(1)
 
-    remaining = list(local_dir.glob("*"))
+    remaining = [p for p in local_dir.glob("*") if _should_offload(p)]
     if remaining:
         logger.warning(f"Offloader finishing with {len(remaining)} files left in scratch (likely stuck/locked): {remaining}")
     else:
@@ -673,6 +842,53 @@ def main():
     args = parse_args()
     logger = setup_logging(args.log_file)
 
+    # -----------------------------------------------------------------
+    # Startup diagnostics (helps debug service/session/licensing hangs)
+    # -----------------------------------------------------------------
+    try:
+        who = subprocess.check_output(['whoami'], text=True, errors='replace').strip()
+        logger.info(f"whoami: {who}")
+    except Exception as ex:
+        logger.debug(f"whoami diagnostic failed: {ex}")
+
+    try:
+        # Session info (session 0 often indicates a Windows service context)
+        q = subprocess.check_output(['cmd','/c','query session'], text=True, errors='replace')
+        q_lines = [ln.strip() for ln in q.splitlines() if ln.strip()]
+        logger.info("query session:\n  " + "\n  ".join(q_lines[:20]))
+    except Exception as ex:
+        logger.debug(f"query session diagnostic failed: {ex}")
+
+    try:
+        logger.info(
+            "Env USER=%s\\%s USERPROFILE=%s SESSIONNAME=%s",
+            os.environ.get('USERDOMAIN',''),
+            os.environ.get('USERNAME',''),
+            os.environ.get('USERPROFILE',''),
+            os.environ.get('SESSIONNAME',''),
+        )
+    except Exception:
+        pass
+
+
+    # Detect service/session-0 context early (AE often hangs here due to invisible modal dialogs / licensing).
+    try:
+        my_sid = get_process_session_id(os.getpid())
+        if my_sid is not None:
+            logger.info(f"Current wrapper SessionId={my_sid}")
+            if my_sid == 0:
+                logger.warning(
+                    "WARNING: This task is running in Windows Session 0 (service context). "
+                    "After Effects/aerender frequently stalls here because any modal dialog "
+                    "(licensing/sign-in, missing font/footage prompts, etc.) cannot be shown. "
+                    "If you see only 'aerender version ...' followed by zero-CPU heartbeats, "
+                    "run the Deadline worker/agent in an interactive session (SESSIONNAME=Console/RDP), "
+                    "or keep a user logged in and start the worker as a normal process instead of a service."
+                )
+    except Exception:
+        pass
+
+
     # Normalize aerender path so blank inputs gracefully fall back to env/PATH/defaults.
     args.aerender_path = resolve_aerender_path(args.aerender_path, logger)
 
@@ -698,6 +914,11 @@ def main():
     try:
         local_scratch_dir.mkdir(parents=True, exist_ok=True)
         logger.info(f"Created local scratch: {local_scratch_dir}")
+
+        # Stage project file locally if it lives on a UNC path (\\server\share\...).
+        # This avoids aerender/AE hangs when opening projects directly from SMB shares.
+        args.project = stage_project_to_local(args.project, local_scratch_dir, logger)
+
     except Exception as e:
         logger.critical(f"Failed to create local scratch {local_scratch_dir}: {e}")
         sys.exit(1)
@@ -762,10 +983,13 @@ def main():
     # 3. Start Offloader Thread
     # -------------------------
     stop_offload_event = threading.Event()
+    output_matcher = build_output_matcher(args.output)
+    protected = [Path(args.project)] if args.project else []
     offloader_thread = threading.Thread(
-        target=offload_worker, 
+        target=offload_worker,
         args=(local_scratch_dir, final_output_dir, stop_offload_event, logger),
-        daemon=False 
+        kwargs={"allow_pred": output_matcher, "protected_paths": protected},
+        daemon=False
     )
     offloader_thread.start()
 
@@ -893,48 +1117,75 @@ def main():
     zero_cpu_global_streak = 0
     job_failed = False
     job_failed_logged = False
-    
+
+    def record_child_line(pid: int, line: str):
+        # Always record last line/time for heartbeat diagnostics
+        logger.info(f"[PID {pid}] {line}")
+        last_log_time[pid] = time.time()
+        last_log_line[pid] = line
+
+        lower_line = (line or "").lower()
+
+        # Render progress hints
+        if pid not in render_progress:
+            if "progress:" in lower_line or "starting composition" in lower_line or "finished composition" in lower_line:
+                render_progress.add(pid)
+
+        # Fatal-error detection: aerender sometimes returns 0 even when it prints an error.
+        if pid not in child_failures:
+            if "aerender error:" in lower_line or "after effects error:" in lower_line:
+                child_failures[pid] = f"aerender reported error: {line[:200]}"
+                logger.error(f"Detected aerender/AE error in PID {pid}; marking worker failed for retry.")
+                try:
+                    psutil.Process(pid).terminate()
+                except Exception:
+                    pass
+                return
+
+            if "unable to call \"openfast\"" in lower_line or "path is not valid" in lower_line:
+                child_failures[pid] = f"Project open failed (openFast/path invalid): {line[:200]}"
+                logger.error(f"Detected project-open failure in PID {pid}; marking worker failed for retry.")
+                try:
+                    psutil.Process(pid).terminate()
+                except Exception:
+                    pass
+                return
+
+            # Existing special-case detections
+            if "error code: 14" in lower_line or "unexpected error occurred while exporting" in lower_line:
+                child_failures[pid] = "After Effects Error Code 14 detected"
+                logger.error(
+                    f"Detected After Effects Error Code 14 in PID {pid} output; terminating worker to force retry."
+                )
+                try:
+                    psutil.Process(pid).terminate()
+                except Exception:
+                    pass
+                return
+
+            if "could not be found" in lower_line and ".tif" in lower_line:
+                child_failures[pid] = "Rendered frame missing on disk"
+                logger.error(
+                    f"PID {pid} reported a missing rendered frame; terminating worker so frames can be retried."
+                )
+                try:
+                    psutil.Process(pid).terminate()
+                except Exception:
+                    pass
+                return
+
     while True:
         # Drain Logs (block briefly to avoid busy-wait CPU burn)
         time_to_heartbeat = max(0.0, HEARTBEAT_SECONDS - (time.time() - last_heartbeat))
         try:
             pid, tag, line = out_q.get(timeout=min(0.5, time_to_heartbeat))
-            logger.info(f"[PID {pid}] {line}")
-            last_log_time[pid] = time.time()
-            last_log_line[pid] = line
-
-            lower_line = line.lower()
-            if pid not in render_progress:
-                if "progress:" in lower_line or "starting composition" in lower_line or "finished composition" in lower_line:
-                    render_progress.add(pid)
-            if pid not in child_failures:
-                if "error code: 14" in lower_line or "unexpected error occurred while exporting" in lower_line:
-                    child_failures[pid] = "After Effects Error Code 14 detected"
-                    logger.error(
-                        f"Detected After Effects Error Code 14 in PID {pid} output; terminating worker to force retry."
-                    )
-                    try:
-                        psutil.Process(pid).terminate()
-                    except Exception:
-                        pass
-
-                if "could not be found" in lower_line and ".tif" in lower_line:
-                    child_failures[pid] = "Rendered frame missing on disk"
-                    logger.error(
-                        f"PID {pid} reported a missing rendered frame; terminating worker so frames can be retried."
-                    )
-                    try:
-                        psutil.Process(pid).terminate()
-                    except Exception:
-                        pass
+            record_child_line(pid, line)
 
             # Drain any remaining lines quickly without another blocking wait
             while True:
                 try:
                     pid, tag, line = out_q.get_nowait()
-                    logger.info(f"[PID {pid}] {line}")
-                    last_log_time[pid] = time.time()
-                    last_log_line[pid] = line
+                    record_child_line(pid, line)
                 except queue.Empty:
                     break
         except queue.Empty:
@@ -1026,9 +1277,16 @@ def main():
                     diag_lines = []
                     for ch in pending_children:
                         pid = ch.popen.pid
+                        afterfx_pid = find_descendant_pid(ch.psutil_proc, "AfterFX.com")
+                        focus_pid = afterfx_pid or pid
+                        sess = get_windows_session_id(focus_pid)
+                        tline = tasklist_verbose_line(focus_pid)
                         diag_lines.append(
                             f"PID {pid}: zero_cpu_streak={zero_cpu_counts.get(pid, 0)}, "
                             f"last_log='{last_log_line.get(pid, 'n/a')}', "
+                            f"afterfx_pid={afterfx_pid if afterfx_pid else 'n/a'}, "
+                            f"session={sess if sess is not None else 'n/a'}, "
+                            f"tasklist='{tline}', "
                             f"descendants={summarize_descendants(ch.psutil_proc)}"
                         )
                     logger.warning("Zero-CPU detailed diagnostics:\n  " + "\n  ".join(diag_lines))
